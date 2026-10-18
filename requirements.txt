@@ -2,3 +2,4 @@ numpy>=2.0
 matplotlib>=3.8
 lightgbm>=4.3
 jupyterlab>=4.2
+ipython>=8.0
