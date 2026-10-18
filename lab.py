@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import pathlib
 import re
 import sys
@@ -462,11 +463,20 @@ def maxsim(ds: Dataset, tokens: Tokens, top: np.ndarray, binary: bool = False) -
 
 
 def topk(ds: Dataset, scores: np.ndarray, k: int = 10) -> np.ndarray:
-    """Per question, the indices of its k best documents, best first, its hidden documents removed."""
-    s = np.where(ds.hidden_mask, -np.inf, scores)
-    best = np.argpartition(-s, k - 1, axis=1)[:, :k]
-    order = np.argsort(-np.take_along_axis(s, best, 1), axis=1, kind="stable")
-    return np.take_along_axis(best, order, 1)
+    """Per question, the indices of its k best documents, best first, its hidden documents removed. Blocks of 64
+    questions run on parallel threads (numpy's partition releases the GIL)."""
+    assert scores.shape == ds.hidden_mask.shape, "one row per question in ds.qids"
+    out = np.empty((len(scores), k), dtype=np.int64)
+
+    def block(rows: slice) -> None:
+        s = np.where(ds.hidden_mask[rows], -np.inf, scores[rows])
+        best = np.argpartition(-s, k - 1, axis=1)[:, :k]
+        order = np.argsort(-np.take_along_axis(s, best, 1), axis=1, kind="stable")
+        out[rows] = np.take_along_axis(best, order, 1)
+
+    with ThreadPoolExecutor(min(8, os.cpu_count() or 1)) as pool:
+        list(pool.map(block, [slice(i, i + 64) for i in range(0, len(scores), 64)]))
+    return out
 
 
 def candidates(ds: Dataset, firsts: list[np.ndarray], k: int) -> np.ndarray:
@@ -514,8 +524,10 @@ def expand(ds: Dataset, top: np.ndarray, scores: np.ndarray) -> np.ndarray:
 
 
 def top(ds: Dataset, qid: str, scores: np.ndarray, k: int = 10) -> list[str]:
-    """The k best documents for one question; scores is a score matrix."""
-    return [ds.ids[i] for i in topk(ds, scores[[ds.qrow[qid]]], k)[0]]
+    """The k best documents for one question, its hidden documents removed; scores is a score matrix."""
+    r = ds.qrow[qid]
+    s = np.where(ds.hidden_mask[r], -np.inf, scores[r])
+    return [ds.ids[i] for i in np.argsort(-s, kind="stable")[:k]]
 
 
 # ---- learning to rank
