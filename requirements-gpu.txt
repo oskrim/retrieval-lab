@@ -1,3 +1,5 @@
 torch>=2.5
+torchvision
 transformers>=5.4
 sentence-transformers>=6.0
+flash-linear-attention>=0.5
