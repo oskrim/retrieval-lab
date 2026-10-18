@@ -1,8 +1,8 @@
-"""Helpers for ladder.ipynb: the data, BM25, score matrices, nDCG@10, plots, and the lab's reranking API.
+"""Helpers for lab.ipynb: the data, BM25, score matrices, nDCG@10, plots, and the lab's reranking API.
 Plain Python and numpy.
 
-  python3 ladder.py fetch [--tokens]       downloads the data (and the late-interaction token vectors) into ./data
-  python3 ladder.py connect URL TOKEN      saves the lab URL and your token (both on your lab page) in .lab.json
+  python3 lab.py fetch [--tokens]       downloads the data (and the late-interaction token vectors) into ./data
+  python3 lab.py connect URL TOKEN      saves the lab URL and your token (both on your lab page) in .lab.json
 """
 
 from __future__ import annotations
@@ -462,6 +462,190 @@ def show(ds: Dataset, qid: str, runs: dict[str, np.ndarray], k: int = 5, chars: 
             print(f"  {i}. [{g or '.'}] {d:<14} {text[:chars]}{'…' if len(text) > chars else ''}")
         print()
 
+
+# ---- advanced: a fake CRM
+
+CRM_TODAY = "2026-10-27"
+INDUSTRIES = ("Financial services", "Insurance", "Healthcare", "Pharmaceuticals", "Retail", "E-commerce", "Logistics",
+              "Manufacturing", "Automotive", "Energy", "Telecommunications", "Media", "Education", "Public sector",
+              "Real estate", "Construction", "Hospitality", "Agriculture", "Software", "Legal services")
+COUNTRIES = {"Finland": 3, "Sweden": 2, "Norway": 2, "Denmark": 1.5, "Iceland": 0.5, "Estonia": 1, "Germany": 2.5,
+             "Austria": 1, "Switzerland": 1, "Netherlands": 1.5, "Belgium": 1, "France": 1.5, "Spain": 1, "Italy": 1,
+             "Portugal": 0.5, "Poland": 1, "Czechia": 0.5, "Ireland": 0.5, "United Kingdom": 2, "United States": 2,
+             "Canada": 1, "Brazil": 0.5, "Japan": 1, "Singapore": 0.5, "Australia": 1}  # country -> relative share of deals
+STAGES = {"Prospecting": 0.1, "Qualification": 0.2, "Discovery": 0.3, "Proposal": 0.5, "Negotiation": 0.7,
+          "Contract sent": 0.9, "Closed won": 1.0, "Closed lost": 0.0}  # stage -> probability of winning
+OWNERS = ("Maria Virtanen", "Jonas Berg", "Anna Schmidt", "Lars Nilsen", "Sofia Rossi", "Mikko Laine", "Emma Johansson",
+          "Lukas Weber", "Olivia Brown", "Pierre Martin", "Aino Korhonen", "Henrik Dahl", "Chloe Dubois", "Tomasz Nowak",
+          "Sara Lindqvist")
+PRODUCTS = ("Analytics Suite", "Data Platform", "Security Add-on", "Support Plus", "Mobile SDK", "Integration Hub",
+            "AI Assistant", "Onboarding Services")
+LEAD_SOURCES = ("Website", "Referral", "Partner", "Trade show", "Cold outreach", "Webinar", "Inbound call", "LinkedIn ad")
+_NAME = (("Aurora", "Boreal", "Cedar", "Delta", "Ember", "Fjord", "Granite", "Harbor", "Iris", "Juniper", "Kestrel",
+          "Lumen", "Meridian", "Nordvik", "Orion", "Polar", "Quartz", "Riverstone", "Sable", "Tundra", "Umbra", "Vega",
+          "Willow", "Zenith", "Alder", "Birch", "Coral", "Dune", "Elm", "Falcon"),
+         ("Systems", "Group", "Labs", "Partners", "Holdings", "Solutions", "Industries", "Works", "Networks", "Logistics",
+          "Health", "Capital", "Energy", "Foods", "Media", "Retail", "Motors", "Bank", "Insurance", "Studio"))
+_NEEDS = ("wants to consolidate reporting across its regional offices", "needs to replace a legacy on-premise system",
+          "wants to cut manual work in invoicing", "wants one view of every customer for the sales team",
+          "must meet new audit requirements next year", "wants to speed up onboarding of new staff",
+          "wants to automate support ticket routing", "needs better demand forecasting", "wants to move off spreadsheets",
+          "needs an integration with SAP", "is tightening data security after a breach", "is expanding into two new markets")
+_COMPETITORS = ("Pipewise", "Kestrel CRM", "Lumio", "Vantage", "Brightdesk")
+_RIVALRY = ("Also evaluating {c}.", "Currently uses {c} and is unhappy with the pricing.", "{c} offered a 30% discount.",
+            "Compared us with {c} in a bake-off.")
+_RISKS = ("Budget freeze until the second quarter.", "Security review still pending.", "Our champion left the company.",
+          "Legal is slow with the data processing agreement.", "Procurement wants three quotes.",
+          "The CFO has not signed off yet.", "Strong executive sponsor, low risk.", "Pilot went well, users are happy.")
+
+
+def crm(n: int = 600, seed: int = 0) -> list[dict]:
+    """n fake deals, the same for the same seed. Revenue grows with headcount and the deal with the company; closed deals
+    closed before CRM_TODAY, open deals close after it."""
+    rng = np.random.default_rng(seed)
+    today = np.datetime64(CRM_TODAY)
+    names = rng.permutation([f"{a} {b}" for a in _NAME[0] for b in _NAME[1]])[:n]
+    share = np.array(list(COUNTRIES.values()))
+    stage_p = np.array([14, 12, 11, 10, 8, 5, 20, 20]) / 100  # share of deals in each stage, in STAGES order
+    deals = []
+    for i in range(n):
+        stage = str(rng.choice(list(STAGES), p=stage_p))
+        employees = int(np.clip(rng.lognormal(5.3, 1.7), 5, 150_000))
+        amount = round(float(np.clip(2000 * employees ** 0.45 * rng.lognormal(0, 0.6), 3000, 2_000_000)), -2)
+        closed = stage.startswith("Closed")
+        close = today - int(rng.integers(1, 365)) if closed else today + int(rng.integers(1, 240))
+        last = close - int(rng.integers(0, 14)) if closed else today - int(rng.exponential(30))
+        notes = [f"{names[i]} {_NEEDS[rng.integers(len(_NEEDS))]}."]
+        if rng.random() < 0.6:
+            notes.append(_RIVALRY[rng.integers(len(_RIVALRY))].format(c=_COMPETITORS[rng.integers(len(_COMPETITORS))]))
+        if rng.random() < 0.6:
+            notes.append(_RISKS[rng.integers(len(_RISKS))])
+        deals.append(dict(deal_id=f"D{i + 1:04d}", company=str(names[i]), industry=str(rng.choice(INDUSTRIES)),
+                          country=str(rng.choice(list(COUNTRIES), p=share / share.sum())), stage=stage,
+                          amount_eur=amount, annual_revenue_eur=round(employees * float(rng.lognormal(np.log(150_000), 0.5)), -4),
+                          employees=employees, probability=STAGES[stage], close_date=str(close), last_activity_date=str(last),
+                          owner=str(rng.choice(OWNERS)), product=str(rng.choice(PRODUCTS)),
+                          lead_source=str(rng.choice(LEAD_SOURCES)), notes=" ".join(notes)))
+    return deals
+
+
+# ---- advanced: a catalog of tools
+
+_CATALOG = """
+crm_search_contacts | Find people in the CRM by name, email or company; returns their phone, email and role. | query
+crm_create_contact | Add a new person to the CRM. | name, email, company, role
+crm_update_deal_stage | Move a sales deal to another pipeline stage. | deal_id, stage
+crm_log_call | Record a phone call with a customer contact: who, when and what was discussed. | contact_id, summary
+crm_create_deal | Open a new sales opportunity for a company. | company, amount_eur, close_date
+crm_get_account | Everything about one customer company: its contacts, open deals and recent activity. | account_id
+create_calendar_event | Add an event to your own calendar. | title, start, end, attendees
+schedule_meeting_room | Reserve a meeting room for a time slot. | room, start, end
+send_meeting_invite | Invite more people to a calendar event that already exists. | event_id, emails
+find_free_slot | Find times when all the given people are free. | attendees, duration_minutes
+cancel_calendar_event | Cancel a calendar event and notify its attendees. | event_id
+list_calendar_events | List your calendar events between two dates. | date_from, date_to
+send_email | Send an email now. | to, subject, body
+reply_to_email | Reply to a message in your inbox. | message_id, body
+search_email | Search your mailbox by sender, subject or words in the message. | query
+create_email_draft | Save an email as a draft to finish and send later. | to, subject, body
+forward_email | Forward a message from your inbox to someone else. | message_id, to
+set_out_of_office_reply | Turn on an automatic away reply for incoming email between two dates. | message, start, end
+post_chat_message | Post a message in a team chat channel. | channel, text
+send_direct_message | Send a private chat message to one person. | user, text
+create_chat_channel | Create a new chat channel and add members. | name, members
+search_chat_messages | Search messages in team chat channels and direct messages. | query
+set_chat_status | Set your chat status text, optionally until a given time. | text, until
+pin_chat_message | Pin a message to the top of a chat channel. | channel, message_id
+create_ticket | Open a support ticket about a customer problem or bug. | title, description, priority
+assign_ticket | Give a support ticket to a specific agent. | ticket_id, assignee
+update_ticket_status | Change a support ticket's status, e.g. open, pending or solved. | ticket_id, status
+add_ticket_comment | Add a comment or internal note to a support ticket. | ticket_id, text
+search_tickets | Search support tickets by words, customer or status. | query
+escalate_ticket | Raise a support ticket to the next support tier with a reason. | ticket_id, reason
+search_wiki | Search the internal wiki and handbook pages. | query
+create_wiki_page | Write a new page in a wiki space. | title, body, space
+update_wiki_page | Change the content of an existing wiki page. | page_id, body
+share_document | Give people access to a document with a permission level (view, comment or edit). | doc_id, emails, permission
+export_document_pdf | Download a document as a PDF file. | doc_id
+comment_on_document | Leave a comment on a document. | doc_id, text
+request_time_off | Ask for vacation or other leave on given days. | start, end, type
+get_time_off_balance | How many vacation days an employee has left this year. | employee
+lookup_employee | Find a colleague's title, team, manager and contact details. | name
+start_onboarding | Start the onboarding checklist for a new hire: contract, accounts and laptop. | employee_name, start_date
+get_org_chart | Show the reporting lines of a team. | team
+submit_performance_review | Submit a performance review with a rating for an employee. | employee, rating, text
+create_invoice | Bill a customer: create an invoice with an amount and a due date. | customer, amount_eur, due_date
+get_invoice_status | Whether an invoice has been paid, is pending or is overdue. | invoice_id
+issue_refund | Return money to a customer for an invoice. | invoice_id, amount_eur, reason
+submit_expense_report | Claim back money you spent for work, with a receipt. | amount_eur, category, receipt_url
+update_billing_details | Change a customer's billing email, address or VAT number. | customer, billing_email, vat_id
+list_overdue_invoices | List the invoices that are past their due date. | customer
+run_sql_query | Run a SQL query against the analytics warehouse. | sql
+get_dashboard | Open a saved analytics dashboard by name. | name
+get_metric | The value of a business metric such as revenue, churn or active users over a period. | metric, date_from, date_to
+create_chart | Draw a chart (line, bar or pie) from a data query. | data_query, chart_type
+export_report_csv | Download a saved report as a CSV file. | report_id
+schedule_report_email | Email a saved report to people on a schedule. | report_id, recipients, frequency
+deploy_service | Release a version of a service to an environment. | service, version, environment
+rollback_deployment | Go back to a service's previous release in an environment. | service, environment
+get_service_logs | Read a service's recent log lines. | service, since
+restart_service | Restart a running service in an environment. | service, environment
+get_alert_status | List the monitoring alerts that are firing for a service. | service
+create_incident | Declare an incident with a severity, page the on-call engineers and open a status page. | title, severity, service
+"""
+TOOL_TASKS = (
+    ("Book the Fjord room tomorrow from 14 to 15 for our design review.", "schedule_meeting_room"),
+    ("Put the dentist in my calendar on Friday at 8.", "create_calendar_event"),
+    ("Add Pekka and Laura to the Q4 planning meeting I already set up.", "send_meeting_invite"),
+    ("When could Anna, Jonas and I all meet for an hour next week?", "find_free_slot"),
+    ("Write back to Tom's last email and tell him Thursday works.", "reply_to_email"),
+    ("Prepare an email to the board about the budget, but don't send it yet.", "create_email_draft"),
+    ("I'm on holiday from 1 to 12 December; let people who write to me know.", "set_out_of_office_reply"),
+    ("Tell the sales channel that the new price list is live.", "post_chat_message"),
+    ("Let Mikko know privately that the build is green.", "send_direct_message"),
+    ("Did anyone on chat mention the Lisbon offsite?", "search_chat_messages"),
+    ("The payment page throws a 500 error for some customers; log it for the support team.", "create_ticket"),
+    ("Hand ticket 4812 over to Sofia.", "assign_ticket"),
+    ("Mark ticket 4812 as solved.", "update_ticket_status"),
+    ("This customer has waited a week and is furious; get the next level of support on ticket 4812.", "escalate_ticket"),
+    ("What does our handbook say about parental leave?", "search_wiki"),
+    ("Give the auditors read access to the Q3 controls spreadsheet.", "share_document"),
+    ("I need the onboarding guide as a PDF to send to a contractor.", "export_document_pdf"),
+    ("How many vacation days do I have left?", "get_time_off_balance"),
+    ("I'm taking next Monday off.", "request_time_off"),
+    ("Who is Sara Lindqvist's manager?", "lookup_employee"),
+    ("Elias starts with us on 3 November; get his paperwork and laptop going.", "start_onboarding"),
+    ("Bill Kestrel Oy 12,400 euros for the October consulting work, due in 30 days.", "create_invoice"),
+    ("Has Brightdesk paid INV-2291 yet?", "get_invoice_status"),
+    ("Give the customer their money back for the double charge on INV-2291.", "issue_refund"),
+    ("Here's my taxi receipt from the client visit, 38 euros.", "submit_expense_report"),
+    ("Which customers owe us money past the due date?", "list_overdue_invoices"),
+    ("What was our churn in September?", "get_metric"),
+    ("Send the weekly sales report to the leadership team every Monday.", "schedule_report_email"),
+    ("Ship version 2.14 of the billing service to production.", "deploy_service"),
+    ("The last checkout release broke production; go back to the one before.", "rollback_deployment"),
+    ("Show me what the search API printed in the last 15 minutes.", "get_service_logs"),
+    ("Is anything going off for the payments service right now?", "get_alert_status"),
+    ("The whole site is down, open a sev-1.", "create_incident"),
+    ("Move the Nordvik deal to negotiation.", "crm_update_deal_stage"),
+    ("I just spoke with the CFO of Aurora Labs on the phone; note what we discussed.", "crm_log_call"),
+    ("What's the phone number of our contact at Cedar Systems?", "crm_search_contacts"),
+    ("Give me the full picture of the Boreal Group account: people, deals and what happened lately.", "crm_get_account"),
+    ("Set my status to 'in workshops' until 5 pm.", "set_chat_status"),
+    ("Write up the incident postmortem as a new page in the Ops space.", "create_wiki_page"),
+    ("Plot weekly signups for the last quarter as a line.", "create_chart"),
+)
+
+
+def tool_catalog() -> list[dict]:
+    """About 60 tools of a workplace assistant as OpenAI function schemas; every parameter is a string."""
+    out = []
+    for line in _CATALOG.strip().splitlines():
+        name, description, params = (p.strip() for p in line.split("|"))
+        props = {p: dict(type="string") for p in params.split(", ")}
+        out.append(dict(type="function", function=dict(name=name, description=description,
+                                                       parameters=dict(type="object", properties=props, required=list(props)))))
+    return out
 
 
 if __name__ == "__main__":
