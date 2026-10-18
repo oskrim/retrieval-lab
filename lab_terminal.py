@@ -14,7 +14,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import lab
 
-ENCODE_ON_GPU = False  # late interaction: False downloads the token vectors (about 1.2 GB); True encodes them on your GPU
+ENCODE_ON_GPU = False  # late interaction: False uses the downloaded token vectors; True encodes them again on your GPU
 
 caiq, fiqa = lab.load("caiq"), lab.load("fiqa")
 DATASETS = (caiq, fiqa)
@@ -347,22 +347,26 @@ for ax, ds in zip(axes, DATASETS):
 fig.tight_layout()
 
 # %%
+def fit_all(ds, x):
+    """Mean nDCG@10 of the linear score trained on every question (in-sample: it only compares features)."""
+    return np.mean(list(lab.evaluate_top(ds, LEX_TOP[ds.name], x @ lab.lambdarank(x, Y[ds.name], lab.ideal_dcg(ds))).values()))
+
 for ds in DATASETS:
     w = lab.lambdarank(X[ds.name], Y[ds.name], lab.ideal_dcg(ds)) / SCALE[ds.name][1]  # weights on the formula's own parts
     w = w / w.max()
     print(f"{ds.name}: score = " + " + ".join(f"{v:.2f} · {f}" for f, v in zip(FEATURES, w) if v > 1e-3))
 
-print(f"\n{'':16s}" + "".join(f"{ds.name + ' gain':>12s}{ds.name + ' drop-one':>16s}" for ds in DATASETS))
-importance = {}
+importance, full = {}, {}
 for ds in DATASETS:
     booster = lgb.train(GBM, lgb.Dataset(X[ds.name].reshape(-1, len(FEATURES)), Y[ds.name].reshape(-1), group=[50] * len(ds.qids)), 200)
     gain = booster.feature_importance("gain") / max(booster.feature_importance("gain").sum(), 1e-9)
-    full = np.mean(list(lab.evaluate_top(ds, LEX_TOP[ds.name], LTR["linear"][ds.name]).values()))
+    full[ds.name] = fit_all(ds, X[ds.name])
     for i, f in enumerate(FEATURES):
-        rest = lab.cross_validate(ds, np.delete(X[ds.name], i, -1), Y[ds.name], linear)
-        importance[ds.name, f] = (gain[i], np.mean(list(lab.evaluate_top(ds, LEX_TOP[ds.name], rest).values())) - full)
+        importance[ds.name, f] = (gain[i], fit_all(ds, np.delete(X[ds.name], i, -1)))
+print(f"\n{'':16s}" + "".join(f"{ds.name + ' gain':>12s}{ds.name + ' nDCG without':>20s}" for ds in DATASETS))
+print(f"{'(all features)':16s}" + "".join(f"{'':12s}{full[ds.name]:20.3f}" for ds in DATASETS))
 for f in FEATURES:
-    print(f"{f:16s}" + "".join(f"{importance[ds.name, f][0]:12.0%}{importance[ds.name, f][1]:+16.3f}" for ds in DATASETS))
+    print(f"{f:16s}" + "".join(f"{importance[ds.name, f][0]:12.0%}{importance[ds.name, f][1]:20.3f}" for ds in DATASETS))
 
 # %%
 for ds in DATASETS:

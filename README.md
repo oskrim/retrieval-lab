@@ -3,14 +3,14 @@
 `lab.ipynb` improves one ranking step by step on two datasets, measuring every step. `lab.py` holds the helpers.
 Python 3.10 or newer (on Ubuntu: `sudo apt install python3-venv`). Your lab page shows these with your URL and token.
 
-Without a GPU (laptop): downloads the data and the late-interaction token vectors, about 1.4 GB; do it before the
-workshop if you can.
+Without a GPU (laptop): downloads the data with every precomputed vector, about 1.3 GB; do it before the workshop
+if you can.
 
 ```bash
 git clone https://github.com/oskrim/retrieval-lab && cd retrieval-lab
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python lab.py fetch --tokens
+.venv/bin/python lab.py fetch
 .venv/bin/python lab.py connect URL TOKEN
 .venv/bin/jupyter lab lab.ipynb
 ```
@@ -19,8 +19,8 @@ In a terminal, without Jupyter: the same steps, then `.venv/bin/ipython -i lab_t
 printing each section's numbers (charts are off), and leaves you in IPython with every variable to explore.
 `lab_terminal.py` is generated from the notebook with `python3 lab.py terminal`.
 
-With a GPU: downloads only the data (136 MB); set `ENCODE_ON_GPU = True` in the notebook's first cell and it encodes
-the token vectors itself (about 10 minutes on an RTX 3090).
+With a GPU: the same download; set `ENCODE_ON_GPU = True` in the notebook's first cell and it encodes the
+late-interaction token vectors again itself (about 10 minutes on an RTX 3090).
 
 ```bash
 git clone https://github.com/oskrim/retrieval-lab && cd retrieval-lab

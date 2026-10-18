@@ -1,7 +1,7 @@
 """Helpers for lab.ipynb: the data, BM25, score matrices, nDCG@10, plots, and the lab's reranking API.
 Plain Python and numpy.
 
-  python3 lab.py fetch [--tokens]       downloads the data (and the late-interaction token vectors) into ./data
+  python3 lab.py fetch                  downloads the data, with every precomputed vector, into ./data
   python3 lab.py connect URL TOKEN      saves the lab URL and your token (both on your lab page) in .lab.json
   python3 lab.py terminal               writes lab_terminal.py, the notebook as one Python file for a terminal
 """
@@ -26,7 +26,7 @@ import snowballstemmer
 
 HERE = pathlib.Path(__file__).resolve().parent
 DATA = HERE / "data"
-RELEASE = "https://github.com/oskrim/retrieval-lab/releases/download/data-v7"
+RELEASE = "https://github.com/oskrim/retrieval-lab/releases/download/data-v8"
 LATE_MODEL = "perplexity-ai/pplx-embed-v2-late-0.6b"
 LAB = HERE / ".lab.json"
 
@@ -55,18 +55,16 @@ class Dataset:
             self.hidden_mask[self.qrow[q], [self.row[d] for d in docs if d in self.row]] = True
 
 
-def fetch(tokens: bool = False) -> pathlib.Path:
-    """Downloads and unpacks the data once (about 140 MB compressed) into ./data; tokens: also the late-interaction
-    token vectors (about 1.2 GB)."""
-    root = DATA / "data-v7"
-    parts = [("data-v7.tar.gz", root)] + ([("late-tokens.tar.gz", root / "fiqa" / "late_tokens")] if tokens else [])
-    for name, done in parts:
-        if not done.exists():
-            DATA.mkdir(exist_ok=True)
-            urllib.request.urlretrieve(f"{RELEASE}/{name}", DATA / name)
-            with tarfile.open(DATA / name) as t:
-                t.extractall(DATA, filter="data")
-            (DATA / name).unlink()
+def fetch() -> pathlib.Path:
+    """Downloads and unpacks the data once into ./data: the documents, questions and grades, and every vector the
+    notebook uses (dense, late-interaction tokens, the advanced sections' texts), about 1.3 GB."""
+    root = DATA / "data-v8"
+    if not root.exists():
+        DATA.mkdir(exist_ok=True)
+        urllib.request.urlretrieve(f"{RELEASE}/data-v8.tar.gz", DATA / "data-v8.tar.gz")
+        with tarfile.open(DATA / "data-v8.tar.gz") as t:
+            t.extractall(DATA, filter="data")
+        (DATA / "data-v8.tar.gz").unlink()
     return root
 
 
@@ -405,14 +403,11 @@ class Tokens:
 
 
 def late_tokens(ds: Dataset, encode_on_gpu: bool = False) -> Tokens:
-    """The token vectors of ds's documents and questions: downloaded, or encoded on your GPU (encode_on_gpu; needs
-    `./setup.sh --gpu`), once; both end up in ./data in the same form."""
-    path = fetch() / ds.name / "late_tokens"
+    """The token vectors of ds's documents and questions: the downloaded ones, or with encode_on_gpu your own, encoded
+    once on your GPU (needs requirements-gpu.txt) into late_tokens_gpu next to them, in the same form."""
+    path = fetch() / ds.name / ("late_tokens_gpu" if encode_on_gpu else "late_tokens")
     if not path.exists():
-        if encode_on_gpu:
-            encode_late_tokens(ds.name, path)
-        else:
-            fetch(tokens=True)
+        encode_late_tokens(ds.name, path)
     z = {f.stem: np.load(f, mmap_mode="r") for f in path.glob("*.npy")}
     assert list(z["doc_ids"]) == ds.ids, "the token vectors belong to another version of the data"
     offs = z["query_offsets"]
@@ -1001,7 +996,7 @@ if __name__ == "__main__":
         print(f"connected as {connect(sys.argv[2], sys.argv[3])}")
     elif sys.argv[1:] == ["terminal"]:
         print(f"wrote {terminal()}")
-    elif sys.argv[1:2] == ["fetch"] and sys.argv[2:] in ([], ["--tokens"]):
-        print(f"data in {fetch(tokens=sys.argv[2:] == ['--tokens'])}")
+    elif sys.argv[1:] == ["fetch"]:
+        print(f"data in {fetch()}")
     else:
         sys.exit(__doc__)
