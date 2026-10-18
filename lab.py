@@ -609,11 +609,6 @@ def rerank(ds: Dataset, top: np.ndarray, model: str) -> np.ndarray:
     return out
 
 
-def grade(ds: Dataset, qid: str, answer: str) -> dict:
-    """The CAIQ rubric's verdict on each row of an answer to question qid."""
-    return call("/api/grade", dict(d=ds.name, qid=qid, answer=answer))
-
-
 def submit(ds: Dataset, search_with, label: str) -> dict:
     """Runs search_with(ds, question, k=10) (document rows, best first) on the leaderboard's hidden FiQA questions and
     sends the results; the lab scores mean nDCG@10 and keeps your best. label: a few words on what your search does."""
@@ -622,6 +617,15 @@ def submit(ds: Dataset, search_with, label: str) -> dict:
     with ThreadPoolExecutor(8) as pool:
         rows = [first] + list(pool.map(lambda q: search_with(ds, q["text"], k=10), qs[1:]))
     return call("/api/board", dict(label=label, ranking={q["id"]: [ds.ids[i] for i in r[:10]] for q, r in zip(qs, rows)}))
+
+
+def submit_agent(answer_with, label: str) -> dict:
+    """Runs answer_with(question) (a set of deal ids) on the agent leaderboard's hidden CRM questions and sends the
+    answers; the lab scores the share answered exactly and keeps your best. label: a few words on what your agent does."""
+    qs = call("/api/agent-board/questions")["questions"]
+    with ThreadPoolExecutor(8) as pool:
+        found = list(pool.map(lambda q: sorted(answer_with(q["text"])), qs))
+    return call("/api/agent-board", dict(label=label, answers={q["id"]: f for q, f in zip(qs, found)}))
 
 
 # ---- plots and examples

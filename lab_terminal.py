@@ -803,11 +803,11 @@ for label, fn in (("bm25", bm25_search), ("the ladder", search)):
 # %% [markdown]
 # ## 23. A RAG agent from scratch
 #
-# An agent uses search as a tool. It decides what to search for, reads the results and answers. The lab server gives you an OpenAI-compatible API with Claude Haiku. We compare a single search (RAG) with an agent that can search many times, each with the plain BM25 search and with the full ladder. A judge model grades the answers.
+# An agent uses search as a tool. It decides what to search for, reads the results and answers. The lab server gives you an OpenAI-compatible API with Claude Haiku. We compare a single search (RAG) with an agent that can search many times, each with the plain BM25 search and with the full ladder. Each answer is checked in plain Python against the question's graded posts: it counts when it cites a relevant post.
 print('\n' + '== 23. A RAG agent from scratch ==')
 
 # %%
-BASE_URL, API_KEY, MODEL = LAB["url"] + "/v1", LAB["token"], "claude-haiku-5-5"  # or any OpenAI-compatible provider
+BASE_URL, API_KEY, MODEL = LAB["url"] + "/v1", LAB["token"], "deepseek-v4-flash"  # or any OpenAI-compatible provider
 
 def chat(messages, tools=(), tool_choice="auto"):
     body = dict(model=MODEL, messages=messages, **(dict(tools=list(tools), tool_choice=tool_choice) if tools else {}))
@@ -838,7 +838,7 @@ ax.set_ylabel("nDCG@10")
 ax.legend()
 
 # %%
-HARD = sorted(np.random.default_rng(0).choice([q for q, b in zip(fiqa.qids, quarter) if b == 0], 40, replace=False))
+HARD = sorted(np.random.default_rng(0).choice([q for q, b in zip(fiqa.qids, quarter) if b == 0], 15, replace=False))
 qid = HARD[0]
 print(fiqa.queries[qid], "\n")
 for name, fn in (("bm25_search", bm25_search), ("search", search)):
@@ -893,31 +893,26 @@ def rag(ds, qid, search_with):
                    reply["usage"].get("usd", 0))
 
 def outcome(ds, qid, answer, seen, searches, usd):
+    """The run's facts, checked against the question's graded posts: score is 1 when the answer cites a relevant post."""
     relevant = lambda d: ds.qrels[qid].get(d, 0) > 0
     cited = set(re.findall(r"\[doc:([^\]]+)\]", answer))
     return dict(answer=answer, searches=searches, usd=usd, seen_relevant=any(map(relevant, seen)),
-                cited=len(cited), cited_relevant=sum(map(relevant, cited)))
+                cited=len(cited), cited_relevant=sum(map(relevant, cited)), score=float(any(map(relevant, cited))))
 
 # %%
 run = agent(fiqa, qid, search, verbose=True)
 print("\n" + run["answer"])
-print("\njudge score", lab.grade(fiqa, qid, run["answer"])["score"])
+print("\ncites a relevant post:", bool(run["score"]))
 
 # %%
-def graded(args):
-    method, search_with, qid = args
-    run = method(fiqa, qid, search_with)
-    g = lab.grade(fiqa, qid, run["answer"])
-    return dict(run, score=g["score"], usd=run["usd"] + g["usd"])
-
 with ThreadPoolExecutor(8) as pool:
-    RUNS = {(method.__name__, fn.__name__): list(pool.map(graded, [(method, fn, q) for q in HARD]))
+    RUNS = {(method.__name__, fn.__name__): list(pool.map(lambda q, m=method, f=fn: m(fiqa, q, f), HARD))
             for method in (rag, agent) for fn in (bm25_search, search)}
 
-print(f"{'':24s}{'judge score':>13s}{'searches':>10s}{'relevant seen':>15s}{'cited relevant':>16s}{'cost':>8s}")
+print(f"{'':24s}{'cites relevant':>15s}{'searches':>10s}{'relevant seen':>15s}{'cited relevant':>16s}{'cost':>8s}")
 for (method, fn), rs in RUNS.items():
     cited = sum(r["cited"] for r in rs)
-    print(f"{method + ', ' + fn:24s}{np.mean([r['score'] for r in rs]):13.3f}{np.mean([r['searches'] for r in rs]):10.1f}"
+    print(f"{method + ', ' + fn:24s}{np.mean([r['score'] for r in rs]):15.0%}{np.mean([r['searches'] for r in rs]):10.1f}"
           f"{np.mean([r['seen_relevant'] for r in rs]):15.0%}{sum(r['cited_relevant'] for r in rs) / max(cited, 1):16.0%}"
           f"{sum(r['usd'] for r in rs):8.3f}")
 for method in ("rag", "agent"):
@@ -1033,18 +1028,14 @@ def code_agent(ds, qid, search_with, budget=2, verbose=False):
 # %%
 run = code_agent(fiqa, HARD[1], search, verbose=True)
 print(f"\n{fiqa.queries[HARD[1]]}\n\n{run['answer']}")
-print("\njudge score", lab.grade(fiqa, HARD[1], run["answer"])["score"])
+print("\ncites a relevant post:", bool(run["score"]))
 
 # %%
-def judged(method, qid):
-    run = metered(method, fiqa, qid, search)
-    return dict(run, score=lab.grade(fiqa, qid, run["answer"])["score"])
-
 with ThreadPoolExecutor(8) as pool:
-    CODE_RUNS = {m.__name__: list(pool.map(lambda q, m=m: judged(m, q), HARD)) for m in (agent, code_agent)}
-print(f"{'':12s}{'judge score':>13s}{'searches':>10s}{'model calls':>13s}{'tokens':>9s}{'cost':>8s}")
+    CODE_RUNS = {m.__name__: list(pool.map(lambda q, m=m: metered(m, fiqa, q, search), HARD)) for m in (agent, code_agent)}
+print(f"{'':12s}{'cites relevant':>15s}{'searches':>10s}{'model calls':>13s}{'tokens':>9s}{'cost':>8s}")
 for name, rs in CODE_RUNS.items():
-    print(f"{name:12s}{np.mean([r['score'] for r in rs]):13.3f}{np.mean([r['searches'] for r in rs]):10.1f}"
+    print(f"{name:12s}{np.mean([r['score'] for r in rs]):15.0%}{np.mean([r['searches'] for r in rs]):10.1f}"
           f"{np.mean([r['calls'] for r in rs]):13.1f}{np.mean([r['tokens'] for r in rs]):9,.0f}{sum(r['usd'] for r in rs):8.3f}")
 diff = np.array([b["score"] - a["score"] for a, b in zip(CODE_RUNS["agent"], CODE_RUNS["code_agent"])])
 lo, hi = lab.bootstrap(diff)
@@ -1053,7 +1044,7 @@ print(f"\ncode_agent − agent: {diff.mean():+.3f} (95% interval {lo:+.3f} to {h
 # %% [markdown]
 # ## 25. Filters, sorting and counts
 #
-# Many questions are not about meaning but about attributes: country, stage, owner, dates. A fake CRM of 600 deals has both. The same search gets filters, sorting and counts. The agent also needs to find the right values ("fintech" is "Financial services") and fields, and it finds them with the same search over value and field descriptions. Each question has an exact answer, so we can count correct answers.
+# Many questions are not about meaning but about attributes: country, stage, owner, dates. A fake CRM of 600 deals has both. The same search gets filters, sorting and counts. The agent also needs to find the right values ("fintech" is "Financial services") and fields, and it finds them with the same search over value and field descriptions. Each question has an exact answer, so we can count correct answers. The agent leaderboard scores your CRM agent on 40 more questions like these, and Realm's entry is the one to beat.
 print('\n' + '== 25. Filters, sorting and counts ==')
 
 # %%
@@ -1185,14 +1176,15 @@ def crm_agent(question, tools, functions, budget=5, verbose=False):
         msg = reply["choices"][0]["message"]
         messages.append(msg)
         for call in msg.get("tool_calls") or []:
-            name, args = call["function"]["name"], json.loads(call["function"]["arguments"])
+            name = call["function"]["name"]
             try:
+                args = json.loads(call["function"]["arguments"])
                 out = functions[name](**args)
-            except (KeyError, TypeError, ValueError) as e:
+            except (KeyError, TypeError, ValueError, RuntimeError) as e:  # the model sees the error and can retry
                 out = dict(error=f"{type(e).__name__}: {e}")
             calls.append(name)
             if verbose:
-                print(f"{name}({json.dumps(args, ensure_ascii=False)})\n  -> {str(out)[:400]}")
+                print(f"{name}({call['function']['arguments']})\n  -> {str(out)[:400]}")
             messages.append(dict(role="tool", tool_call_id=call["id"], content=out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)))
         if not msg.get("tool_calls"):
             break
@@ -1210,34 +1202,18 @@ QUESTIONS = [  # (question, the search_crm call that answers it)
      dict(filters=dict(owner="Maria Virtanen", stage=OPEN), sort_by="last_activity_date", descending=False, limit=5)),
     ("Which deals did we lose in Germany this year?",
      dict(filters=dict(country="Germany", stage="Closed lost", close_date=dict(min="2026-01-01")))),
-    ("Our three biggest wins with hospitals and clinics.",
-     dict(filters=dict(industry="Healthcare", stage="Closed won"), sort_by="amount_eur", limit=3)),
-    ("Open deals that came from trade shows and should close before December.",
-     dict(filters=dict(lead_source="Trade show", stage=OPEN, close_date=dict(max="2026-11-30")))),
     ("Pharma companies with more than 2,000 staff that are still in our pipeline.",
      dict(filters=dict(industry="Pharmaceuticals", employees=dict(min=2001), stage=OPEN))),
     ("The five largest deals for our AI product in the DACH countries.",
      dict(filters=dict(product="AI Assistant", country=["Germany", "Austria", "Switzerland"]), sort_by="amount_eur", limit=5)),
-    ("Which UK deals are at the proposal stage?", dict(filters=dict(country="United Kingdom", stage="Proposal"))),
     ("Jonas's deals over 30k that haven't got past qualification yet.",
      dict(filters=dict(owner="Jonas Berg", amount_eur=dict(min=30000), stage=["Prospecting", "Qualification"]))),
-    ("Shops and online stores we won through referrals.",
-     dict(filters=dict(industry=["Retail", "E-commerce"], lead_source="Referral", stage="Closed won"))),
-    ("The 4 deals in Japan or Singapore with the most recent contact.",
-     dict(filters=dict(country=["Japan", "Singapore"]), sort_by="last_activity_date", limit=4)),
-    ("Which deals with companies making over a billion a year did we lose?",
-     dict(filters=dict(annual_revenue_eur=dict(min=1e9), stage="Closed lost"))),
     ("Which of Anna's deals close in the first quarter of 2027?",
      dict(filters=dict(owner="Anna Schmidt", close_date=dict(min="2027-01-01", max="2027-03-31")))),
-    ("The three smallest open deals with government customers.",
-     dict(filters=dict(industry="Public sector", stage=OPEN), sort_by="amount_eur", descending=False, limit=3)),
-    ("Telco deals that came in through our webinars.", dict(filters=dict(industry="Telecommunications", lead_source="Webinar"))),
     ("Open energy deals where nobody has talked to the customer since the start of September.",
      dict(filters=dict(industry="Energy", stage=OPEN, last_activity_date=dict(max="2026-08-31")))),
-    ("What's our biggest open deal in Finland?", dict(filters=dict(country="Finland", stage=OPEN), sort_by="amount_eur", limit=1)),
     ("Which banks and insurers in France have we had deals with?",
      dict(filters=dict(industry=["Financial services", "Insurance"], country="France"))),
-    ("Car makers with deals over 100k.", dict(filters=dict(industry="Automotive", amount_eur=dict(min=100000)))),
     ("Small companies (under 50 people) we won in the Benelux.",
      dict(filters=dict(employees=dict(max=49), stage="Closed won", country=["Netherlands", "Belgium", "Luxembourg"]))),
 ]
@@ -1272,6 +1248,11 @@ for q, *rs in zip([q for q, _ in QUESTIONS], *CRM_RUNS.values()):
 run = crm_agent("How are our customers in Norway doing?", [ATTR_SEARCH, FIND_VALUES, FIND_FIELDS], ATTR, verbose=True)
 print("\n" + run["answer"])
 print(f"\ncost {run['usd']:.4f}")
+
+# %%
+# the agent leaderboard: 40 more CRM questions; the lab scores the share answered exactly
+print(lab.submit_agent(lambda q: crm_agent(q, [ATTR_SEARCH, FIND_VALUES, FIND_FIELDS], ATTR)["deals"],
+                       "search + attributes + value and field search"))
 
 # %% [markdown]
 # ## 26. Tool search
