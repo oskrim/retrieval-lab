@@ -1,0 +1,439 @@
+{
+"groups": [
+{
+"phrases": [
+"non resident",
+"nonresident"
+]
+},
+{
+"phrases": [
+"exchange rate",
+"fx rate",
+"currency exchange rate"
+]
+},
+{
+"phrases": [
+"octopus deploy",
+"octopus",
+"octopusdeploy"
+]
+},
+{
+"phrases": [
+"dlp",
+"data loss prevention",
+"data leak prevention",
+"data leakage prevention"
+]
+},
+{
+"phrases": [
+"bcp",
+"business continuity plan",
+"business continuity planning",
+"business continuity plans",
+"bc plan"
+]
+},
+{
+"phrases": [
+"encryption key",
+"encryption keys",
+"cryptographic key",
+"cryptographic keys",
+"crypto keys",
+"crypto key"
+]
+},
+{
+"phrases": [
+"business continuity",
+"business continuity management",
+"bcm",
+"continuity of business",
+"operational continuity",
+"continuity management"
+]
+},
+{
+"phrases": [
+"data center",
+"datacenter",
+"data centre",
+"data centers",
+"datacenters",
+"data centres",
+"hosting facility",
+"colocation facility",
+"colocation",
+"colo"
+]
+},
+{
+"phrases": [
+"physical security",
+"physical access control",
+"physical access controls",
+"physical protection",
+"facility security",
+"physical safeguards",
+"physical controls"
+]
+},
+{
+"phrases": [
+"third party",
+"third parties",
+"third party vendor",
+"third party vendors",
+"third party provider",
+"third party providers",
+"third party service provider",
+"third party service providers",
+"external provider",
+"external providers"
+]
+},
+{
+"phrases": [
+"asset management",
+"asset inventory",
+"inventory of assets",
+"asset register",
+"information asset inventory",
+"it asset management",
+"itam",
+"asset tracking",
+"assets inventory"
+]
+},
+{
+"phrases": [
+"legal and regulatory requirements",
+"applicable laws and regulations",
+"laws and regulations",
+"statutory and regulatory requirements",
+"regulatory requirements",
+"legal requirements",
+"statutory requirements",
+"legal obligations",
+"regulatory obligations",
+"compliance obligations",
+"applicable legal requirements",
+"legal contractual and regulatory requirements",
+"contractual and regulatory requirements",
+"applicable regulations"
+]
+},
+{
+"phrases": [
+"external audit",
+"external audits",
+"independent audit",
+"independent audits",
+"third party audit report",
+"third party audits",
+"independent assessment",
+"independent assessor",
+"external auditor",
+"independent auditor",
+"independent third party audit",
+"external assessment",
+"external assessor",
+"third party auditor",
+"external certification audit",
+"certification audit",
+"independent external audit",
+"third party audit"
+]
+},
+{
+"phrases": [
+"planned intervals",
+"scheduled intervals",
+"regular intervals",
+"defined intervals"
+]
+},
+{
+"phrases": [
+"significant changes",
+"major changes",
+"material changes",
+"significant change",
+"major change",
+"significant organizational changes",
+"significant organisational changes",
+"material change"
+]
+},
+{
+"phrases": [
+"mobile devices",
+"mobile device",
+"smartphones",
+"mobile phones"
+]
+},
+{
+"phrases": [
+"security awareness training",
+"security training",
+"awareness training",
+"security awareness program",
+"security education",
+"cybersecurity training",
+"infosec training"
+]
+},
+{
+"phrases": [
+"customer data",
+"client data",
+"tenant data",
+"customer content",
+"customer information"
+]
+},
+{
+"phrases": [
+"schwab",
+"charles schwab"
+]
+},
+{
+"phrases": [
+"15 year mortgage",
+"15 year fixed",
+"fifteen year mortgage",
+"15 yr mortgage"
+]
+},
+{
+"phrases": [
+"us dollar",
+"usd",
+"u s dollar"
+]
+},
+{
+"phrases": [
+"expense ratio",
+"expense ratios",
+"management expense ratio"
+]
+},
+{
+"phrases": [
+"tenant",
+"lessee",
+"renter"
+]
+},
+{
+"phrases": [
+"capital gains tax",
+"cgt",
+"tax on capital gains"
+]
+},
+{
+"phrases": [
+"wash sale",
+"wash sale rule"
+]
+},
+{
+"phrases": [
+"diversification",
+"diversify",
+"diversified portfolio"
+]
+},
+{
+"phrases": [
+"interest rate",
+"interest rates",
+"rate of interest"
+]
+},
+{
+"phrases": [
+"duration",
+"bond duration"
+]
+},
+{
+"phrases": [
+"buy",
+"purchase",
+"acquire"
+]
+},
+{
+"phrases": [
+"expensive",
+"costly",
+"pricey",
+"high cost"
+]
+},
+{
+"phrases": [
+"set up",
+"establish"
+]
+},
+{
+"phrases": [
+"immediately",
+"right away",
+"instantly"
+]
+},
+{
+"phrases": [
+"significant",
+"substantial",
+"considerable"
+]
+},
+{
+"phrases": [
+"additional",
+"extra",
+"further"
+]
+},
+{
+"phrases": [
+"mainly",
+"mostly",
+"largely",
+"primarily"
+]
+},
+{
+"phrases": [
+"unable to",
+"cannot",
+"can not"
+]
+},
+{
+"phrases": [
+"have to",
+"must",
+"required to",
+"obliged to"
+]
+},
+{
+"phrases": [
+"accountant",
+"bookkeeper"
+]
+},
+{
+"phrases": [
+"permit",
+"allow",
+"enable"
+]
+},
+{
+"phrases": [
+"goal",
+"objective",
+"aim"
+]
+},
+{
+"phrases": [
+"income",
+"earnings"
+]
+},
+{
+"phrases": [
+"kid",
+"child"
+]
+},
+{
+"phrases": [
+"company",
+"firm",
+"corporation",
+"enterprise"
+]
+},
+{
+"phrases": [
+"shop",
+"store",
+"retailer"
+]
+},
+{
+"phrases": [
+"continue",
+"carry on",
+"keep going"
+]
+},
+{
+"phrases": [
+"need",
+"require"
+]
+},
+{
+"phrases": [
+"give",
+"provide",
+"supply"
+]
+},
+{
+"phrases": [
+"govern",
+"regulate"
+]
+},
+{
+"phrases": [
+"calculate",
+"compute",
+"work out"
+]
+},
+{
+"phrases": [
+"example",
+"instance"
+]
+},
+{
+"phrases": [
+"bad",
+"terrible"
+]
+},
+{
+"phrases": [
+"phone",
+"telephone"
+]
+},
+{
+"phrases": [
+"approve",
+"authorize",
+"sanction"
+]
+}
+]
+}

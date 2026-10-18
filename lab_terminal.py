@@ -44,25 +44,137 @@ for ds in DATASETS:
     print(f"relevant (grade {ds.qrels[qid][best]}): {ds.titles[ds.row[best]]} {ds.texts[ds.row[best]][:300]}\n")
 
 # %% [markdown]
-# ## 2. BM25
-print('\n' + '== 2. BM25 ==')
+# ## 2. From text to terms
+print('\n' + '== 2. From text to terms ==')
 
 # %%
-TEXT = {ds.name: lab.bm25(ds, ds.texts) for ds in DATASETS}
-runs = {ds.name: {"bm25 (text)": lab.evaluate(ds, TEXT[ds.name])} for ds in DATASETS}
-for ds in DATASETS:
-    print(f"{ds.name}: nDCG@10 {np.mean(list(runs[ds.name]['bm25 (text)'].values())):.3f}")
+for s in ("Is data-at-rest encrypted (AES-256)?", "Café naïve ﬁnance: 401(k) or IRA?", "TLS_1.2 vs. TLS-1.3"):
+    print(f"{s!r:40} -> {lab.tokenize(s)}")
+
+# %%
+STOP = lab.Analyzer(stopwords=True)  # tokens without stopwords
+STEM = lab.Analyzer(stopwords=True, stemming=True)  # ... and each word reduced to its stem
+
+words = lab.tokenize("Are encryption keys rotated and are encrypted backups stored offsite?")
+print("tokens:   ", words)
+print("stopwords:", [w for w in words if w in lab.STOPWORDS])
+print("terms:    ", STEM.terms(" ".join(words))[0])
 
 # %% [markdown]
-# ## 3. Add the title
-print('\n' + '== 3. Add the title ==')
+# ## 3. An inverted index
+print('\n' + '== 3. An inverted index ==')
 
 # %%
-own = {ds.name: lab.bm25(ds, ds.titles) for ds in DATASETS}  # the title's IDF from the titles alone
-TEXT = {ds.name: lab.bm25(ds, ds.texts, idf_texts=ds.title_text) for ds in DATASETS}  # from here on, every field's IDF
-TITLE = {ds.name: lab.bm25(ds, ds.titles, idf_texts=ds.title_text) for ds in DATASETS}  # comes from title and text together
+ix = lab.index(caiq.texts, STOP)
+docs, tf = ix.postings("encryption")
+print(f"encryption: in {len(docs)} of {ix.n} documents; postings (document, count): {list(zip(docs[:5].tolist(), tf[:5].astype(int).tolist()))} …")
+keys = ix.occurrences("encryption")[:5]
+print(f"occurrences (document, position): {[(int(k // lab.STRIDE), int(k % lab.STRIDE)) for k in keys]} …")
+
+a, b = ix.postings("encryption")[0], ix.postings("keys")[0]
+print(f"encryption AND keys: {len(np.intersect1d(a, b))} documents; encryption OR keys: {len(np.union1d(a, b))}")
+docs, tf = ix.where([(0, "encryption"), (1, "keys")])  # "keys" one position after "encryption"
+print(f'"encryption keys": {len(docs)} documents, {int(tf.sum())} times')
+
+print(f"\n{'':20s}{'terms':>12s}{'occurrences':>14s}{'terms':>12s}{'occurrences':>14s}")
+print(f"{'':20s}{'caiq':>26s}{'fiqa':>26s}")
+for name, a in (("tokens", lab.TOKENS), ("without stopwords", STOP), ("stemmed", STEM)):
+    print(f"{name:20s}" + "".join(f"{len(lab.index(ds.texts, a).vocab):12,d}{int(lab.index(ds.texts, a).lengths.sum()):14,d}" for ds in DATASETS))
+
+# %% [markdown]
+# ## 4. Matching words
+print('\n' + '== 4. Matching words ==')
+
+# %%
+MATCH = {ds.name: lab.matching(ds, ds.texts) for ds in DATASETS}  # how many of the question's words each document has
+runs = {ds.name: {"matching words": lab.evaluate(ds, MATCH[ds.name])} for ds in DATASETS}
+lab.plot_ladder(runs);
+
+# %%
+lab.show(caiq, caiq.qids[0], {"matching words": MATCH["caiq"]})
+
+# %% [markdown]
+# ## 5. Stopwords
+print('\n' + '== 5. Stopwords ==')
+
+# %%
+MATCH_STOP = {ds.name: lab.matching(ds, ds.texts, STOP) for ds in DATASETS}
 for ds in DATASETS:
-    per_field = lab.evaluate(ds, lab.bm25(ds, ds.texts) + own[ds.name])
+    runs[ds.name]["+ stopwords"] = lab.evaluate(ds, MATCH_STOP[ds.name])
+example = lab.example(fiqa, runs["fiqa"]["matching words"], runs["fiqa"]["+ stopwords"])
+lab.show(fiqa, example, {"matching words": MATCH["fiqa"], "+ stopwords": MATCH_STOP["fiqa"]})
+lab.plot_ladder(runs);
+
+# %% [markdown]
+# ## 6. TF-IDF
+print('\n' + '== 6. TF-IDF ==')
+
+# %%
+TFIDF = {ds.name: lab.tfidf(ds, ds.texts, STOP) for ds in DATASETS}
+for ds in DATASETS:
+    runs[ds.name]["tf-idf"] = lab.evaluate(ds, TFIDF[ds.name])
+example = lab.example(caiq, runs["caiq"]["+ stopwords"], runs["caiq"]["tf-idf"], broken=True)
+lab.show(caiq, example, {"+ stopwords": MATCH_STOP["caiq"], "tf-idf": TFIDF["caiq"]})
+lab.plot_ladder(runs);
+
+# %%
+for d in lab.top(caiq, example, TFIDF["caiq"], 3):
+    terms = STOP.terms(caiq.texts[caiq.row[d]])[0]
+    common = sorted(set(terms), key=terms.count, reverse=True)[:5]
+    print(f"{d}: {len(terms):,} terms; most frequent: " + ", ".join(f"{t} ×{terms.count(t)}" for t in common))
+
+# %% [markdown]
+# ## 7. BM25
+print('\n' + '== 7. BM25 ==')
+
+# %%
+BM25 = {ds.name: lab.bm25(ds, ds.texts, analyzer=STOP) for ds in DATASETS}
+for ds in DATASETS:
+    runs[ds.name]["bm25"] = lab.evaluate(ds, BM25[ds.name])
+example = lab.example(caiq, runs["caiq"]["tf-idf"], runs["caiq"]["bm25"])
+lab.show(caiq, example, {"tf-idf": TFIDF["caiq"], "bm25": BM25["caiq"]})
+lab.plot_ladder(runs);
+
+# %%
+K1, B = (0.6, 1.2, 2.0), (0, 0.25, 0.5, 0.75, 1)
+grid = {(ds.name, k1, b): np.mean(list(lab.evaluate(ds, lab.bm25(ds, ds.texts, k1, b, analyzer=STOP)).values()))
+        for ds in DATASETS for k1 in K1 for b in B}
+fig, axes = plt.subplots(1, 2, figsize=(11, 3))
+for ax, ds in zip(axes, DATASETS):
+    for k1 in K1:
+        ax.plot(B, [grid[ds.name, k1, b] for b in B], marker="o", label=f"k1 = {k1}")
+    ax.set_title(ds.name)
+    ax.set_xlabel("b")
+    ax.set_ylabel("nDCG@10")
+    ax.legend(fontsize=8)
+fig.tight_layout()
+for ds in DATASETS:
+    print(f"{ds.name:6s}" + "".join(f"{'b = ' + str(b):>10s}" for b in B))
+    for k1 in K1:
+        print(f"k1 {k1:<3}" + "".join(f"{grid[ds.name, k1, b]:10.3f}" for b in B))
+
+# %% [markdown]
+# ## 8. Stemming
+print('\n' + '== 8. Stemming ==')
+
+# %%
+STEMMED = {ds.name: lab.bm25(ds, ds.texts, analyzer=STEM) for ds in DATASETS}
+for ds in DATASETS:
+    runs[ds.name]["+ stemming"] = lab.evaluate(ds, STEMMED[ds.name])
+example = lab.example(caiq, runs["caiq"]["bm25"], runs["caiq"]["+ stemming"])
+lab.show(caiq, example, {"bm25": BM25["caiq"], "+ stemming": STEMMED["caiq"]})
+lab.plot_ladder(runs);
+
+# %% [markdown]
+# ## 9. Add the title
+print('\n' + '== 9. Add the title ==')
+
+# %%
+own = {ds.name: lab.bm25(ds, ds.titles, analyzer=STEM) for ds in DATASETS}  # the title's IDF from the titles alone
+TEXT = {ds.name: lab.bm25(ds, ds.texts, idf_texts=ds.title_text, analyzer=STEM) for ds in DATASETS}  # from here on, every
+TITLE = {ds.name: lab.bm25(ds, ds.titles, idf_texts=ds.title_text, analyzer=STEM) for ds in DATASETS}  # field's IDF is the same
+for ds in DATASETS:
+    per_field = lab.evaluate(ds, STEMMED[ds.name] + own[ds.name])
     shared = lab.evaluate(ds, TEXT[ds.name] + TITLE[ds.name])
     print(f"{ds.name}: text + title, IDF per field {np.mean(list(per_field.values())):.3f}, "
           f"IDF over title and text together {np.mean(list(shared.values())):.3f}")
@@ -71,21 +183,44 @@ del own
 lab.plot_ladder(runs);
 
 # %%
-gain = {q: runs["caiq"]["+ title"][q] - runs["caiq"]["bm25 (text)"][q] for q in caiq.qids}
-example = max(gain, key=gain.get)
-lab.show(caiq, example, {"bm25 (text)": TEXT["caiq"], "+ title": TEXT["caiq"] + TITLE["caiq"]})
+example = lab.example(caiq, runs["caiq"]["+ stemming"], runs["caiq"]["+ title"])
+lab.show(caiq, example, {"+ stemming": STEMMED["caiq"], "+ title": TEXT["caiq"] + TITLE["caiq"]})
 
 # %% [markdown]
-# ## 4. Let's look at the top matches
-print('\n' + "== 4. Let's look at the top matches ==")
+# ## 10. Synonyms
+print('\n' + '== 10. Synonyms ==')
+
+# %%
+ANALYZER = lab.Analyzer(stopwords=True, stemming=True, synonyms=lab.synonyms())  # every lexical step from here on
+print(f"{len(ANALYZER.groups)} synonym groups, e.g.")
+for group in ANALYZER.groups[:6]:
+    print("  " + " | ".join(" ".join(p) for p in group))
+for ds in DATASETS:
+    found = sum(bool(ANALYZER.query(ds.queries[q])[1]) for q in ds.qids)
+    print(f"{ds.name}: {found} of {len(ds.qids)} questions contain a synonym phrase")
+words, groups = ANALYZER.query(caiq.queries[caiq.qids[0]])
+print(f"\n{caiq.queries[caiq.qids[0]]}\n  words: {words}\n  phrases: {groups}")
+
+# %%
+WITHOUT = {ds.name: TEXT[ds.name] + TITLE[ds.name] for ds in DATASETS}
+TEXT = {ds.name: lab.bm25(ds, ds.texts, idf_texts=ds.title_text, analyzer=ANALYZER) for ds in DATASETS}
+TITLE = {ds.name: lab.bm25(ds, ds.titles, idf_texts=ds.title_text, analyzer=ANALYZER) for ds in DATASETS}
+for ds in DATASETS:
+    runs[ds.name]["+ synonyms"] = lab.evaluate(ds, TEXT[ds.name] + TITLE[ds.name])
+example = lab.example(caiq, runs["caiq"]["+ title"], runs["caiq"]["+ synonyms"])
+lab.show(caiq, example, {"+ title": WITHOUT["caiq"], "+ synonyms": TEXT["caiq"] + TITLE["caiq"]})
+lab.plot_ladder(runs);
+
+# %% [markdown]
+# ## 11. Let's look at the top matches
+print('\n' + "== 11. Let's look at the top matches ==")
 
 # %%
 def saturated(ds, S):
     return TEXT[ds.name] / (S + TEXT[ds.name]) + TITLE[ds.name] / (S + TITLE[ds.name])
 
-sat10 = lab.evaluate(caiq, saturated(caiq, 10))
-example = max(caiq.qids, key=lambda q: sat10[q] - runs["caiq"]["+ title"][q])
-lab.show(caiq, example, {"+ title": TEXT["caiq"] + TITLE["caiq"]})
+example = lab.example(caiq, runs["caiq"]["+ synonyms"], lab.evaluate(caiq, saturated(caiq, 10)))
+lab.show(caiq, example, {"+ synonyms": TEXT["caiq"] + TITLE["caiq"]})
 
 # %%
 fig, axes = plt.subplots(1, 2, figsize=(11, 3.5))
@@ -108,8 +243,8 @@ for ds in DATASETS:
     print(f"{ds.name}: {len(irrelevant[ds.name])} irrelevant documents, {in_top:.2f} of them in the top 10 per question")
 
 # %% [markdown]
-# ## 5. Saturated BM25
-print('\n' + '== 5. Saturated BM25 ==')
+# ## 12. Saturated BM25
+print('\n' + '== 12. Saturated BM25 ==')
 
 # %%
 text, title = TEXT["caiq"][caiq.qrow[example]], TITLE["caiq"][caiq.qrow[example]]
@@ -134,15 +269,15 @@ for ds in DATASETS:
 lab.plot_ladder(runs);
 
 # %%
-lab.show(caiq, example, {"+ title": TEXT["caiq"] + TITLE["caiq"], "saturated": saturated(caiq, S)})
+lab.show(caiq, example, {"+ synonyms": TEXT["caiq"] + TITLE["caiq"], "saturated": saturated(caiq, S)})
 
 # %% [markdown]
-# ## 6. Phrase match
-print('\n' + '== 6. Phrase match ==')
+# ## 13. Phrase match
+print('\n' + '== 13. Phrase match ==')
 
 # %%
-PHRASE_TEXT = {ds.name: lab.phrase(ds, ds.texts) for ds in DATASETS}
-PHRASE_TITLE = {ds.name: lab.phrase(ds, ds.titles) for ds in DATASETS}
+PHRASE_TEXT = {ds.name: lab.phrase(ds, ds.texts, ANALYZER) for ds in DATASETS}
+PHRASE_TITLE = {ds.name: lab.phrase(ds, ds.titles, ANALYZER) for ds in DATASETS}
 PHRASE = {n: 0.5 * PHRASE_TEXT[n] + PHRASE_TITLE[n] for n in PHRASE_TEXT}
 
 def lexical(ds, w=0.2):
@@ -167,8 +302,8 @@ example = max(gain, key=gain.get)
 lab.show(fiqa, example, {"saturated": saturated(fiqa, S), "+ phrase": lexical(fiqa)})
 
 # %% [markdown]
-# ## 7. Learning to rank
-print('\n' + '== 7. Learning to rank ==')
+# ## 14. Learning to rank
+print('\n' + '== 14. Learning to rank ==')
 
 # %%
 import lightgbm as lgb
@@ -240,8 +375,8 @@ example = max(gain, key=gain.get)
 lab.show(caiq, example, {"+ phrase": lexical(caiq), "learning to rank": lab.expand(caiq, LEX_TOP["caiq"], LTR["linear"]["caiq"])})
 
 # %% [markdown]
-# ## 8. Dense embeddings
-print('\n' + '== 8. Dense embeddings ==')
+# ## 15. Dense embeddings
+print('\n' + '== 15. Dense embeddings ==')
 
 # %%
 VEC = {ds.name: lab.vectors(ds) for ds in DATASETS}
@@ -268,22 +403,24 @@ ax.set_ylabel("nDCG@10")
 ax.legend(fontsize=7)
 
 # %%
-def rrf(k, *scores):
-    """Reciprocal rank fusion: each list adds 1 / (k + rank) for every document; the scores themselves are dropped."""
-    return sum(1 / (k + np.argsort(np.argsort(-s, axis=1), axis=1) + 1) for s in scores)
+def rrf(k, *scores, depth=1000):
+    """Reciprocal rank fusion of each list's top `depth`: a document gains 1 / (k + rank) from every list that has it."""
+    out = np.zeros(scores[0].shape, dtype=np.float32)
+    depth = min(depth, out.shape[1])
+    for s in scores:
+        top = np.argpartition(-s, depth - 1, axis=1)[:, :depth]  # the top `depth`, unordered: no full sort needed
+        top = np.take_along_axis(top, np.argsort(-np.take_along_axis(s, top, 1), axis=1), 1)
+        gain = np.zeros_like(out)
+        np.put_along_axis(gain, top, 1 / (k + np.arange(1, depth + 1, dtype=np.float32)), 1)
+        out += gain
+    return out
 
-ks = (1, 10, 30, 60, 100, 300, 1000)
-fig, ax = plt.subplots(figsize=(6, 3.5))
+RRF_K = {"caiq": 10, "fiqa": 1}  # the best k of 1, 10, 30, 60, 100, 300 and 1000 on these questions
 for ds in DATASETS:
-    ax.plot(ks, [np.mean(list(lab.evaluate(ds, rrf(k, COS[ds.name], lexical(ds))).values())) for k in ks], marker="o",
-            label=f"{ds.name}: RRF(dense, lexical)")
-    color = ax.lines[-1].get_color()
-    ax.axhline(np.mean(list(lab.evaluate(ds, hybrid(ds)).values())), ls="--", color=color, label=f"{ds.name}: cos + saturated bm25")
-    ax.axhline(np.mean(list(dense[ds.name].values())), ls=":", color=color, label=f"{ds.name}: cos alone")
-ax.set_xscale("log")
-ax.set_xlabel("k")
-ax.set_ylabel("nDCG@10")
-ax.legend(fontsize=7)
+    mean = lambda s: np.mean(list(lab.evaluate(ds, s).values()))
+    print(f"{ds.name}: cos + saturated bm25 {mean(hybrid(ds)):.3f}, "
+          f"RRF of the two (best k = {RRF_K[ds.name]}) {mean(rrf(RRF_K[ds.name], COS[ds.name], lexical(ds))):.3f}, "
+          f"cos alone {np.mean(list(dense[ds.name].values())):.3f}, saturated bm25 alone {mean(lexical(ds)):.3f}")
 
 # %%
 for ds in DATASETS:
@@ -296,8 +433,8 @@ example = max(gain, key=gain.get)
 lab.show(fiqa, example, {"+ phrase": lexical(fiqa), "+ dense": hybrid(fiqa)})
 
 # %% [markdown]
-# ## 9. Long documents
-print('\n' + '== 9. Long documents ==')
+# ## 16. Long documents
+print('\n' + '== 16. Long documents ==')
 
 # %%
 VEC512 = {ds.name: lab.vectors(ds, window=512) for ds in DATASETS}
@@ -340,8 +477,8 @@ climbed = [q for r, q in enumerate(fiqa.qids) if (~keep)[top[r]].any() and not (
 lab.show(fiqa, climbed[0], {"512 tokens": COS512["fiqa"], "whole document": COS["fiqa"]})
 
 # %% [markdown]
-# ## 10. Binary embeddings
-print('\n' + '== 10. Binary embeddings ==')
+# ## 17. Binary embeddings
+print('\n' + '== 17. Binary embeddings ==')
 
 # %%
 def signs(x):
@@ -373,7 +510,9 @@ fig.tight_layout()
 windows = (5, 10, 20, 30, 50, 100)
 fig, ax = plt.subplots(figsize=(6, 3.5))
 for ds in DATASETS:
-    curve = [np.mean(list(lab.evaluate(ds, lab.rescore(ds, CENTERED[ds.name], ASYM[ds.name], k)).values())) for k in windows]
+    top = lab.topk(ds, CENTERED[ds.name], max(windows))  # the bits' top 100, once; each window is a prefix of it
+    asym = np.take_along_axis(ASYM[ds.name], top, 1)
+    curve = [np.mean(list(lab.evaluate_top(ds, top[:, :k], asym[:, :k]).values())) for k in windows]
     ax.plot(windows, curve, marker="o", label=f"{ds.name}: centered bits top k, then float question × bits")
     ax.axhline(np.mean(list(lab.evaluate(ds, ASYM[ds.name]).values())), ls="--", color=ax.lines[-1].get_color(),
                label=f"{ds.name}: float question × bits, every document")
@@ -393,8 +532,8 @@ for ds in DATASETS:
 lab.plot_ladder(runs);
 
 # %% [markdown]
-# ## 11. Late interaction
-print('\n' + '== 11. Late interaction ==')
+# ## 18. Late interaction
+print('\n' + '== 18. Late interaction ==')
 
 # %% [markdown]
 # Late interaction (ColBERT) keeps one vector per token and matches each question token to its best document token. Its value depends on the model and dataset: LateOn improves FiQA, but contributes almost nothing on CAIQ. This section compares three precomputed models with Perplexity's new v2 0.6B model.
@@ -457,8 +596,8 @@ for ds in DATASETS:
     print(f"{ds.name}: " + ", ".join(f"{form} {max(CURVE[form, ds.name]):.3f} ({size[form]:,.0f} bytes per document)" for form in LATE))
 
 # %% [markdown]
-# ## 12. Cross-encoder
-print('\n' + '== 12. Cross-encoder ==')
+# ## 19. Cross-encoder
+print('\n' + '== 19. Cross-encoder ==')
 
 # %%
 MODELS = ("qwen3-reranker-8b", "voyage-rerank-3")
@@ -496,8 +635,8 @@ lab.show(caiq, example, {"binary first stage": STEP5["caiq"],
                             "+ cross-encoder": lab.expand(caiq, TOP20["caiq"], reranked(caiq, LAM_CE["caiq"], "voyage-rerank-3"))})
 
 # %% [markdown]
-# ## 13. How sure are we?
-print('\n' + '== 13. How sure are we? ==')
+# ## 20. How sure are we?
+print('\n' + '== 20. How sure are we? ==')
 
 # %%
 PER_Q = {ds.name: {step: np.array([r[q] for q in ds.qids]) for step, r in runs[ds.name].items()} for ds in DATASETS}
@@ -531,8 +670,8 @@ axes[0].invert_yaxis()
 fig.tight_layout()
 
 # %% [markdown]
-# ## 14. Debugging failing questions
-print('\n' + '== 14. Debugging failing questions ==')
+# ## 21. Debugging failing questions
+print('\n' + '== 21. Debugging failing questions ==')
 
 # %%
 FINAL = {ds.name: reranked(ds, LAM_CE[ds.name], "voyage-rerank-3") for ds in DATASETS}
@@ -551,8 +690,8 @@ worst = min(caiq.qids, key=lambda q: runs["caiq"]["+ cross-encoder"][q])
 lab.show(caiq, worst, {"binary first stage": STEP5["caiq"], "+ cross-encoder": lab.expand(caiq, TOP20["caiq"], FINAL["caiq"])})
 
 # %% [markdown]
-# ## 15. Leaderboard
-print('\n' + '== 15. Leaderboard ==')
+# ## 22. Leaderboard
+print('\n' + '== 22. Leaderboard ==')
 
 # %%
 import json, re, urllib.error, urllib.request
@@ -584,8 +723,9 @@ def search(ds, query, qid=None, k=5, mask=None, rerank=True):
     one = lab.single(ds, query, qid)
     keep = np.ones(len(ds.ids), dtype=bool) if mask is None else np.asarray(mask)
     only = lambda s: np.where(keep, s, -np.inf)
-    text, title = lab.bm25(one, ds.texts, idf_texts=ds.title_text), lab.bm25(one, ds.titles, idf_texts=ds.title_text)
-    lexical = text / (S + text) + title / (S + title) + 0.2 * (0.5 * lab.phrase(one, ds.texts) + lab.phrase(one, ds.titles))
+    text = lab.bm25(one, ds.texts, idf_texts=ds.title_text, analyzer=ANALYZER)
+    title = lab.bm25(one, ds.titles, idf_texts=ds.title_text, analyzer=ANALYZER)
+    lexical = text / (S + text) + title / (S + title) + 0.2 * (0.5 * lab.phrase(one, ds.texts, ANALYZER) + lab.phrase(one, ds.titles, ANALYZER))
     q = embed(query)
     mean, bits = DOC_BITS[ds.name]
     n = min(20, len(ds.ids))
@@ -599,7 +739,7 @@ def search(ds, query, qid=None, k=5, mask=None, rerank=True):
     return top[0][np.argsort(-fused[0])][:k]
 
 def bm25_search(ds, query, qid=None, k=5):
-    """The ladder's first step: BM25 over the text only."""
+    """Plain BM25 over the text."""
     one = lab.single(ds, query, qid)
     return lab.topk(one, lab.bm25(one, ds.texts), k)[0]
 
@@ -615,8 +755,8 @@ for label, fn in (("bm25", bm25_search), ("the ladder", search)):
     print(label, lab.submit(fiqa, fn, label))
 
 # %% [markdown]
-# ## 16. A RAG agent from scratch
-print('\n' + '== 16. A RAG agent from scratch ==')
+# ## 23. A RAG agent from scratch
+print('\n' + '== 23. A RAG agent from scratch ==')
 
 # %%
 BASE_URL, API_KEY, MODEL = LAB["url"] + "/v1", LAB["token"], "claude-haiku-5-5"  # or any OpenAI-compatible provider
@@ -630,7 +770,7 @@ print(reply["choices"][0]["message"]["content"])
 print(reply["usage"])
 
 # %%
-INDEX, _ = lab.index(fiqa.texts)
+INDEX = lab.index(fiqa.texts)
 
 def overlap(ds, qid):
     """How much of the question's wording (weighted by idf) its best relevant post contains."""
@@ -642,7 +782,7 @@ def overlap(ds, qid):
 OVERLAP = np.array([overlap(fiqa, q) for q in fiqa.qids])
 quarter = np.digitize(OVERLAP, np.quantile(OVERLAP, [0.25, 0.5, 0.75]))
 fig, ax = plt.subplots(figsize=(7, 3.5))
-for k, step in enumerate(("bm25 (text)", "+ dense", "+ cross-encoder")):
+for k, step in enumerate(("bm25", "+ dense", "+ cross-encoder")):
     ax.bar(np.arange(4) + 0.27 * (k - 1), [np.mean([runs["fiqa"][step][q] for q, b in zip(fiqa.qids, quarter) if b == j])
                                             for j in range(4)], 0.27, label=step)
 ax.set_xticks(range(4), [f"quarter {j + 1}\n(overlap ≤ {OVERLAP[quarter == j].max():.2f})" for j in range(4)])
@@ -737,8 +877,8 @@ for method in ("rag", "agent"):
     print(f"{method}: search − bm25_search {diff.mean():+.3f} ± {1.96 * diff.std() / np.sqrt(len(diff)):.3f} (95%)")
 
 # %% [markdown]
-# ## 17. Code mode
-print('\n' + '== 17. Code mode ==')
+# ## 24. Code mode
+print('\n' + '== 24. Code mode ==')
 
 # %%
 import builtins, io, sys, threading
@@ -861,22 +1001,22 @@ lo, hi = lab.bootstrap(diff)
 print(f"\ncode_agent − agent: {diff.mean():+.3f} (95% interval {lo:+.3f} to {hi:+.3f}) over {len(diff)} questions")
 
 # %% [markdown]
-# ## 18. Filters, sorting and counts
-print('\n' + '== 18. Filters, sorting and counts ==')
+# ## 25. Filters, sorting and counts
+print('\n' + '== 25. Filters, sorting and counts ==')
 
 # %%
 import operator
 from collections import Counter
 
 DEALS = lab.crm(n=600, seed=0)
-CATEGORIES = ("industry", "country", "stage", "owner", "product", "lead_source")
+CATEGORIES = lab.CATEGORIES
 NUMBERS = ("amount_eur", "annual_revenue_eur", "employees", "probability")
 print(f"{len(DEALS)} deals; fields: {', '.join(DEALS[0])}\n")
 for d in DEALS[:3]:
     print(json.dumps(d, ensure_ascii=False), "\n")
 
 # %%
-VECS = {}
+VECS = lab.embeddings()  # precomputed with the data; anything else is embedded by the lab
 
 def embed_many(texts):
     """Unit pplx vectors of texts, 16 per request; each text is embedded once."""
@@ -888,17 +1028,14 @@ def embed_many(texts):
             VECS[t] = v / np.linalg.norm(v)
     return np.stack([VECS[t] for t in texts])
 
-def index(name, ids, titles, texts):
-    """A dataset that `search` can search: the documents and their pplx vectors (no questions)."""
+def index(name):
+    """A dataset that `search` can search (lab.documents(name)): the documents and their pplx vectors, no questions."""
+    ids, titles, texts = lab.documents(name)
     d = embed_many([f"{t}\n{x}" for t, x in zip(titles, texts)])
     VEC[name], DOC_BITS[name] = (d, None), (d.mean(0), signs(d - d.mean(0)))
     return lab.Dataset(name, list(ids), list(titles), list(texts), {}, {}, {})
 
-def deal_text(d):
-    """A deal as a document: its notes, then its attributes in words, so that plain search can find them too."""
-    return d["notes"] + " " + "; ".join(f"{f.replace('_', ' ')}: {d[f]}" for f in d if f not in ("deal_id", "company", "notes")) + "."
-
-CRM = index("crm", [d["deal_id"] for d in DEALS], [d["company"] for d in DEALS], [deal_text(d) for d in DEALS])
+CRM = index("crm")
 
 def key(field, x):
     return float(x) if field in NUMBERS else str(x).lower()  # dates are YYYY-MM-DD, so they compare as text
@@ -933,14 +1070,9 @@ print(search_crm(filters={"country": ["Finland", "Sweden"], "amount_eur": {"min"
                  fields=["company", "country", "stage", "amount_eur"], limit=3, group_by="stage"))
 
 # %%
-VALUES = [(f, v) for f in CATEGORIES for v in sorted({d[f] for d in DEALS})]
-VALUE_DS = index("crm-values", [f"{f}={v}" for f, v in VALUES], [f.replace("_", " ") for f, _ in VALUES], [v for _, v in VALUES])
-FIELDS = {"amount_eur": "the value of the deal in euros", "annual_revenue_eur": "the customer company's yearly revenue in euros",
-          "employees": "how many people work at the customer company",
-          "probability": "the chance of winning the deal, 0 to 1, set by its stage",
-          "close_date": "the date the deal closed or is expected to close",
-          "last_activity_date": "the date of the latest call, email or meeting with the customer"}
-FIELD_DS = index("crm-fields", list(FIELDS), [f.replace("_", " ") for f in FIELDS], list(FIELDS.values()))
+VALUE_DS = index("crm-values")
+VALUES = [tuple(i.split("=", 1)) for i in VALUE_DS.ids]
+FIELD_DS = index("crm-fields")
 
 def find_values(text, field=None, k=10):
     """The values of the category fields that best match text, e.g. "fintech" -> industry "Financial services"."""
@@ -1090,14 +1222,13 @@ print("\n" + run["answer"])
 print(f"\ncost {run['usd']:.4f}")
 
 # %% [markdown]
-# ## 19. Tool search
-print('\n' + '== 19. Tool search ==')
+# ## 26. Tool search
+print('\n' + '== 26. Tool search ==')
 
 # %%
 CATALOG = lab.tool_catalog()
 TOOL_NAMES = [t["function"]["name"] for t in CATALOG]
-TOOLS_DS = index("tools", TOOL_NAMES, [n.replace("_", " ") for n in TOOL_NAMES],
-                 [f"{f['description']} Parameters: {', '.join(f['parameters']['properties'])}." for f in (t["function"] for t in CATALOG)])
+TOOLS_DS = index("tools")
 TASKS = [task for task, _ in lab.TOOL_TASKS]
 embed_many(TASKS)  # one batch of requests instead of one per task
 

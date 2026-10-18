@@ -14,6 +14,7 @@ import pathlib
 import re
 import sys
 import tarfile
+import unicodedata
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -21,12 +22,12 @@ from array import array
 from dataclasses import dataclass
 
 import numpy as np
+import snowballstemmer
 
 HERE = pathlib.Path(__file__).resolve().parent
 DATA = HERE / "data"
 RELEASE = "https://github.com/oskrim/retrieval-lab/releases/download/data-v7"
 LATE_MODEL = "perplexity-ai/pplx-embed-v2-late-0.6b"
-TOKEN = re.compile(r"[a-z0-9]+")
 LAB = HERE / ".lab.json"
 
 
@@ -89,86 +90,280 @@ def single(ds: Dataset, text: str, qid: str | None = None) -> Dataset:
                    {key: ds.hidden.get(qid, set())}, ds.title_text)
 
 
+# ---- text: normalizing, tokens, terms
+
+WORD = re.compile(r"[^\W_]+")  # runs of Unicode letters and digits; everything else separates words
+STOPWORDS = frozenset("""a an and are as at be been but by can could did do does for from had has have how i if in into is
+it its me my of on or our over should so than that the their them then there these they this those to was we were what
+when where which while who why will with would you your""".split())
+_STEMMER = snowballstemmer.stemmer("english")
+_STEMS: dict[str, str] = {}  # every word is stemmed once
+
+
+def normalize(text: str) -> str:
+    """Lowercase, accents removed (é -> e), compatibility forms folded (ﬁ -> fi): Unicode NFKD, combining marks dropped."""
+    if text.isascii():
+        return text.lower()
+    nfkd = unicodedata.normalize("NFKD", text)
+    return nfkd.lower() if nfkd.isascii() else "".join(c for c in nfkd if not unicodedata.combining(c)).casefold()
+
+
 def tokenize(text: str) -> list[str]:
-    return TOKEN.findall(text.lower())
+    return WORD.findall(normalize(text))
 
 
-# ---- BM25
+def stem(word: str) -> str:
+    """The word's Snowball (Porter 2) stem: encrypt, encrypted, encryption -> encrypt."""
+    if word not in _STEMS:
+        _STEMS[word] = _STEMMER.stemWord(word)
+    return _STEMS[word]
 
-class BM25:
-    """BM25 over one field: score(q, d) = sum over query terms t of idf(t) * tf * (k1 + 1) / (tf + k1 * (1 - b + b * len / avg)).
-    idf_texts: the texts whose document frequencies give idf (default: texts), e.g. every field of a document together."""
 
-    def __init__(self, texts: list[str], k1: float = 1.2, b: float = 0.75, idf_texts: list[str] | None = None) -> None:
+def synonyms() -> list[dict]:
+    """The synonym groups in synonyms.json: {phrases: [...]}, phrases that mean the same."""
+    return json.loads((HERE / "synonyms.json").read_text())["groups"]
+
+
+class Analyzer:
+    """How text becomes the terms an index counts: its tokens, optionally without stopwords and stemmed. With synonym
+    groups, a question's synonym phrases (found longest first, over stemmed tokens) become alternatives: each group
+    scores as its best-matching alternative phrase (see Index.bm25)."""
+
+    def __init__(self, stopwords: bool = False, stemming: bool = False, synonyms: list[dict] = ()) -> None:
+        self.stopwords, self.stemming = stopwords, stemming
+        self.groups = [[tokenize(p) for p in group["phrases"] if tokenize(p)] for group in synonyms]
+        self.phrases: dict[tuple[str, ...], int] = {}
+        for g, alternatives in enumerate(self.groups):
+            for tokens in alternatives:
+                self.phrases.setdefault(tuple(stem(t) for t in tokens), g)
+        self.longest = max(map(len, self.phrases), default=0)
+        self.starts = {k[0] for k in self.phrases}
+
+    def word(self, token: str) -> str | None:
+        """The term a token becomes, or None for a dropped stopword."""
+        if self.stopwords and token in STOPWORDS:
+            return None
+        return stem(token) if self.stemming else token
+
+    def terms(self, text: str) -> tuple[list[str], list[int]]:
+        """The terms of text and their positions (the token's place in text, so dropped stopwords leave gaps)."""
+        out = [(w, i) for i, w in enumerate(map(self.word, tokenize(text))) if w is not None]
+        return [w for w, _ in out], [i for _, i in out]
+
+    def query(self, text: str) -> tuple[list[str], list[tuple[list[str], list[list[tuple[int, str]]]]]]:
+        """A question's terms outside synonym phrases, and for each synonym phrase in it: the phrase's own terms and
+        the group's alternatives, each as (offset, term) pairs (a dropped stopword leaves its offset unused)."""
+        tokens = tokenize(text)
+        spans = self.concepts(tokens)
+        inside = {i + k for _, i, n in spans for k in range(n)}
+        words = [w for i, w in enumerate(map(self.word, tokens)) if w is not None and i not in inside]
+        groups = []
+        for g, i, n in spans:
+            own = [w for w in map(self.word, tokens[i:i + n]) if w is not None]
+            alternatives = [[(k, w) for k, w in enumerate(map(self.word, alt)) if w is not None] for alt in self.groups[g]]
+            groups.append((own, [a for a in alternatives if a]))
+        return words, groups
+
+    def concepts(self, tokens: list[str]) -> list[tuple[int, int, int]]:
+        """(group, position, length) of every synonym phrase in tokens: longest match first, left to right, no overlaps."""
+        if not self.phrases:
+            return []
+        stems, found, i = [stem(t) for t in tokens], [], 0
+        while i < len(stems):
+            for n in range(min(self.longest, len(stems) - i), 0, -1) if stems[i] in self.starts else ():
+                g = self.phrases.get(tuple(stems[i:i + n]))
+                if g is not None:
+                    found.append((g, i, n))
+                    i += n
+                    break
+            else:
+                i += 1
+        return found
+
+
+TOKENS = Analyzer()  # tokens as they are: no stopwords removed, no stemming, no synonyms
+
+
+# ---- a positional inverted index
+
+STRIDE = 1 << 32  # an occurrence's key is document * STRIDE + position
+
+
+_tokenized: dict[int, tuple[list[str], dict[str, int], np.ndarray, np.ndarray]] = {}
+
+
+def tokenized(texts: list[str]) -> tuple[dict[str, int], np.ndarray, np.ndarray]:
+    """texts as one array of word numbers, done once per list: (word -> number, the numbers of every text one after
+    another, where each text starts)."""
+    if id(texts) not in _tokenized:
+        words: dict[str, int] = {}
+        ids, start = array("q"), [0]
+        for text in texts:
+            ids.extend(words.setdefault(t, len(words)) for t in tokenize(text))
+            start.append(len(ids))
+        _tokenized[id(texts)] = (texts, words, np.frombuffer(ids, dtype=np.int64), np.array(start))  # holding texts keeps its id
+    return _tokenized[id(texts)][1:]
+
+
+class Index:
+    """A positional inverted index of texts (one per document): for every term, the documents that contain it, how
+    often (its postings), and at which positions. idf_texts: the texts whose document frequencies give idf (default:
+    texts), e.g. every field of a document together."""
+
+    def __init__(self, texts: list[str], analyzer: Analyzer = TOKENS, idf_texts: list[str] | None = None) -> None:
+        self.analyzer, self.n = analyzer, len(texts)
+        words, ids, start = tokenized(texts)
         self.vocab: dict[str, int] = {}
-        rows, cols, lengths = array("q"), array("q"), np.zeros(len(texts))
-        for i, text in enumerate(texts):
-            toks = tokenize(text)
-            lengths[i] = len(toks)
-            for t in toks:
-                rows.append(self.vocab.setdefault(t, len(self.vocab)))
-                cols.append(i)
-        key = np.frombuffer(rows, dtype=np.int64) * len(texts) + np.frombuffer(cols, dtype=np.int64)
-        uniq, tf = np.unique(key, return_counts=True)
-        term, self.doc, self.tf = uniq // len(texts), (uniq % len(texts)).astype(np.int64), tf.astype(np.float64)
-        self.start = np.searchsorted(term, np.arange(len(self.vocab) + 1))
-        df, n = np.diff(self.start), len(texts)
-        if idf_texts is not None:
-            counts: dict[str, int] = {}
-            for text in idf_texts:
-                for t in set(tokenize(text)):
-                    if t in self.vocab:
-                        counts[t] = counts.get(t, 0) + 1
-            df, n = np.array([counts.get(t, 0) for t in self.vocab]), len(idf_texts)
+        to_term = np.array([-1 if w is None else self.vocab.setdefault(w, len(self.vocab))
+                            for w in map(analyzer.word, words)] or [-1], dtype=np.int64)  # word number -> term, -1 if dropped
+        doc = np.repeat(np.arange(self.n), np.diff(start))
+        pos = np.arange(len(ids)) - start[doc]
+        term = to_term[ids]
+        kept = term >= 0
+        term, doc, pos = term[kept], doc[kept], pos[kept]
+        self.lengths = np.bincount(doc, minlength=self.n).astype(np.float64)
+        order = np.argsort(term, kind="stable")  # occurrences come in document and position order already
+        term, self.keys = term[order], doc[order] * STRIDE + pos[order]  # every occurrence: document * STRIDE + position
+        self.key_start = np.searchsorted(term, np.arange(len(self.vocab) + 1))
+        posting = term * self.n + doc[order]  # one per occurrence; equal neighbours are the same term in the same document
+        first = np.flatnonzero(np.r_[True, posting[1:] != posting[:-1]]) if len(posting) else np.zeros(0, dtype=np.int64)
+        self.doc, self.tf = posting[first] % self.n, np.diff(np.r_[first, len(posting)]).astype(np.float64)
+        self.start = np.searchsorted(posting[first] // self.n, np.arange(len(self.vocab) + 1))
+        df, n = np.diff(self.start), self.n
+        if idf_texts is not None:  # document frequency over other texts, under the same analyzer
+            other_words, other_ids, other_start = tokenized(idf_texts)
+            other_term = np.array([self.vocab.get(w, -1) if w is not None else -1 for w in map(analyzer.word, other_words)]
+                                  or [-1], dtype=np.int64)[other_ids]
+            other_doc = np.repeat(np.arange(len(idf_texts)), np.diff(other_start))
+            pairs = np.unique(other_term[other_term >= 0] * len(idf_texts) + other_doc[other_term >= 0])
+            df, n = np.bincount(pairs // len(idf_texts), minlength=len(self.vocab)), len(idf_texts)
         self.idf = np.log(1 + (n - df + 0.5) / (df + 0.5))
-        avg = lengths.mean() if lengths.any() else 1.0
-        self.norm = k1 * (1 - b + b * lengths / avg)
-        self.k1, self.n = k1, len(texts)
+        self.avg = self.lengths.mean() if self.lengths.any() else 1.0
 
-    def scores(self, query: str) -> np.ndarray:
+    def postings(self, term: str) -> tuple[np.ndarray, np.ndarray]:
+        """The documents containing term and how often it occurs in each."""
+        k = self.vocab.get(term)
+        return (self.doc[self.start[k]:self.start[k + 1]], self.tf[self.start[k]:self.start[k + 1]]) if k is not None \
+            else (np.zeros(0, dtype=np.int64), np.zeros(0))
+
+    def occurrences(self, term: str) -> np.ndarray:
+        """Every occurrence of term, as document * STRIDE + position, sorted."""
+        k = self.vocab.get(term)
+        return self.keys[self.key_start[k]:self.key_start[k + 1]] if k is not None else np.zeros(0, dtype=np.int64)
+
+    def term_bm25(self, term: str, k1: float = 1.2, b: float = 0.75) -> np.ndarray:
+        """One term's BM25 contribution in every document: idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * len / avg))."""
         out = np.zeros(self.n)
-        for t in set(tokenize(query)):
-            if t in self.vocab:
-                k = self.vocab[t]
-                d, tf = self.doc[self.start[k]:self.start[k + 1]], self.tf[self.start[k]:self.start[k + 1]]
-                out[d] += self.idf[k] * tf * (self.k1 + 1) / (tf + self.norm[d])
+        docs, tf = self.postings(term)
+        if len(docs):
+            out[docs] = self.idf[self.vocab[term]] * tf * (k1 + 1) / (tf + k1 * (1 - b + b * self.lengths[docs] / self.avg))
         return out
 
+    def where(self, phrase: list[tuple[int, str]]) -> tuple[np.ndarray, np.ndarray]:
+        """The documents in which the phrase's terms occur at its offsets (first term at p, the next at p + offset...),
+        and how often."""
+        (o0, t0), rest = phrase[0], phrase[1:]
+        at = self.occurrences(t0)
+        for o, t in rest:  # keep the starts whose next term sits the right distance after them
+            following = self.occurrences(t)
+            if not len(at) or not len(following):
+                return np.zeros(0, dtype=np.int64), np.zeros(0)
+            want = at + (o - o0)
+            at = at[following[np.minimum(np.searchsorted(following, want), len(following) - 1)] == want]
+        docs, tf = np.unique(at // STRIDE, return_counts=True)
+        return docs, tf.astype(np.float64)
 
-_indexes: dict[tuple[int, int, float, float], tuple[list[str], list[str] | None, BM25, dict[int, str]]] = {}
+    def term_idf(self, term: str) -> float:
+        """idf of term; a term no document contains gets the idf of the rarest possible term."""
+        k = self.vocab.get(term)
+        return float(self.idf[k]) if k is not None else float(np.log(1 + (self.n + 0.5) / 0.5))
+
+    def bm25(self, query: str, k1: float = 1.2, b: float = 0.75) -> np.ndarray:
+        """BM25 summed over the query's terms. A synonym phrase counts as its best alternative in each document (max
+        across the alternatives). An alternative found as a phrase scores like one term with the question phrase's
+        weight (the sum of its own terms' idf) and the alternative's count; the phrase's own terms also score as loose
+        words, as plain BM25 would. So a synonym is worth as much as the question's own wording, never more."""
+        words, groups = self.analyzer.query(query)
+        out = sum((self.term_bm25(t, k1, b) for t in set(words)), np.zeros(self.n))
+        for own, alternatives in groups:
+            best = sum((self.term_bm25(t, k1, b) for t in set(own)), np.zeros(self.n))
+            weight = sum(self.term_idf(t) for t in set(own))
+            for phrase in alternatives:
+                docs, tf = self.where(phrase)
+                if len(docs):
+                    norm = k1 * (1 - b + b * self.lengths[docs] / self.avg)
+                    best[docs] = np.maximum(best[docs], weight * tf * (k1 + 1) / (tf + norm))
+            out += best
+        return out
+
+    def phrase(self, query: str) -> np.ndarray:
+        """Per document: the share of the query's neighbouring word pairs that occur in it the same distance apart.
+        Pairs of two stopwords don't count. A dropped stopword keeps its place: "data at rest" needs rest two after data."""
+        tokens = tokenize(query)
+        words = [(i, self.analyzer.word(t), t in STOPWORDS) for i, t in enumerate(tokens)]
+        words = [w for w in words if w[1] is not None]
+        pairs = [(a, b) for a, b in zip(words, words[1:]) if not (a[2] and b[2])]
+        out = np.zeros(self.n)
+        for (i, a, _), (j, b, _) in pairs:
+            first, second = self.occurrences(a) + (j - i), self.occurrences(b)
+            few, many = (first, second) if len(first) <= len(second) else (second, first)
+            if len(few) and len(many):  # look each of the rarer word's occurrences up in the other's sorted list
+                hit = few[many[np.minimum(np.searchsorted(many, few), len(many) - 1)] == few]
+                out[np.unique(hit // STRIDE)] += 1
+        return out / max(len(pairs), 1)
+
+    def matching(self, query: str) -> np.ndarray:
+        """Per document: how many of the query's distinct terms it contains."""
+        out = np.zeros(self.n)
+        for t in set(self.analyzer.terms(query)[0]):
+            out[self.postings(t)[0]] += 1
+        return out
+
+    def tfidf(self, query: str) -> np.ndarray:
+        """score(q, d) = sum over q's terms t of tf(t, d) * idf(t)."""
+        out = np.zeros(self.n)
+        for t in set(self.analyzer.terms(query)[0]):
+            docs, tf = self.postings(t)
+            if len(docs):
+                out[docs] += tf * self.idf[self.vocab[t]]
+        return out
+
+_indexes: dict[tuple[int, int, int], tuple[list[str], Analyzer, list[str] | None, Index]] = {}
 
 
-def index(texts: list[str], k1: float = 1.2, b: float = 0.75, idf_texts: list[str] | None = None) -> tuple[BM25, dict[int, str]]:
-    """The BM25 index of texts, built once per list, and its cache of padded token strings for phrase()."""
-    key = (id(texts), id(idf_texts), k1, b)
+def index(texts: list[str], analyzer: Analyzer = TOKENS, idf_texts: list[str] | None = None) -> Index:
+    """The index of texts under analyzer, built once per (texts, analyzer, idf_texts)."""
+    key = (id(texts), id(analyzer), id(idf_texts))
     if key not in _indexes:
-        _indexes[key] = (texts, idf_texts, BM25(texts, k1, b, idf_texts), {})  # holding the lists keeps their ids from being reused
-    return _indexes[key][2], _indexes[key][3]
+        _indexes[key] = (texts, analyzer, idf_texts, Index(texts, analyzer, idf_texts))  # holding them keeps their ids unique
+    return _indexes[key][3]
 
 
 # ---- score matrices: one row per question (in ds.qids order), one column per document
 
-def bm25(ds: Dataset, texts: list[str], k1: float = 1.2, b: float = 0.75, idf_texts: list[str] | None = None) -> np.ndarray:
-    """BM25 of every question against texts (one per document); idf_texts as in BM25."""
-    index_, _ = index(texts, k1, b, idf_texts)
-    return np.stack([index_.scores(ds.queries[q]) for q in ds.qids]).astype(np.float32)
+def _rows(ds: Dataset, score) -> np.ndarray:
+    return np.stack([score(ds.queries[q]) for q in ds.qids]).astype(np.float32)
 
 
-def phrase(ds: Dataset, texts: list[str]) -> np.ndarray:
-    """Per question and document: the share of the question's word pairs (bigrams) that appear as adjacent words."""
-    index_, padded = index(texts)
-    out = np.zeros((len(ds.qids), len(texts)), dtype=np.float32)
-    for r, q in enumerate(ds.qids):
-        toks = tokenize(ds.queries[q])
-        grams = [(a, b) for a, b in zip(toks, toks[1:]) if a in index_.vocab and b in index_.vocab]
-        for a, b in grams:
-            docs = lambda t: index_.doc[index_.start[index_.vocab[t]]:index_.start[index_.vocab[t] + 1]]  # noqa: E731
-            for i in np.intersect1d(docs(a), docs(b)):
-                if i not in padded:
-                    padded[i] = " " + " ".join(tokenize(texts[i])) + " "
-                out[r, i] += f" {a} {b} " in padded[i]
-        out[r] /= max(len(toks) - 1, 1)
-    return out
+def bm25(ds: Dataset, texts: list[str], k1: float = 1.2, b: float = 0.75, idf_texts: list[str] | None = None,
+         analyzer: Analyzer = TOKENS) -> np.ndarray:
+    """BM25 of every question against texts (one per document)."""
+    ix = index(texts, analyzer, idf_texts)
+    return _rows(ds, lambda q: ix.bm25(q, k1, b))
+
+
+def phrase(ds: Dataset, texts: list[str], analyzer: Analyzer = TOKENS) -> np.ndarray:
+    """Per question and document: the share of the question's word pairs found the same distance apart (Index.phrase)."""
+    return _rows(ds, index(texts, analyzer).phrase)
+
+
+def matching(ds: Dataset, texts: list[str], analyzer: Analyzer = TOKENS) -> np.ndarray:
+    """Per question and document: how many of the question's distinct terms the document contains."""
+    return _rows(ds, index(texts, analyzer).matching)
+
+
+def tfidf(ds: Dataset, texts: list[str], analyzer: Analyzer = TOKENS, idf_texts: list[str] | None = None) -> np.ndarray:
+    return _rows(ds, index(texts, analyzer, idf_texts).tfidf)
 
 
 def vectors(ds: Dataset, window: int = 8192) -> tuple[np.ndarray, np.ndarray]:
@@ -448,7 +643,40 @@ def plot_ladder(runs: dict[str, dict[str, dict[str, float]]]):
     axes[0][0].set_ylim(len(steps) - 0.5, -0.8)
     axes[0][0].set_yticks(range(len(steps)), steps)
     fig.tight_layout()
+    print_ladder(runs)
     return fig
+
+
+def print_ladder(runs: dict[str, dict[str, dict[str, float]]]) -> None:
+    """The ladder as a table: each step's mean nDCG@10 per dataset and its change from the step before."""
+    steps = list(dict.fromkeys(step for r in runs.values() for step in r))
+    width = max(map(len, steps)) + 2
+    print(" " * width + "".join(f"{name:>10s}{'':9s}" for name in runs))
+    prev: dict[str, float] = {}
+    for step in steps:
+        cells = []
+        for name, r in runs.items():
+            if step not in r:
+                cells.append(" " * 19)
+                continue
+            mean = float(np.mean(list(r[step].values())))
+            cells.append(f"{mean:10.3f}" + (f" ({mean - prev[name]:+.3f})" if name in prev else " " * 9))
+            prev[name] = mean
+        print(f"{step:{width}s}" + "".join(cells))
+
+
+def example(ds: Dataset, before: dict[str, float], after: dict[str, float], broken: bool = False) -> str:
+    """Prints what a step changes (nDCG@10 per question before and after) and returns a question it fixes: below 0.3
+    before and above 0.7 after, the largest such gain (any question if none is). broken: a question it breaks instead."""
+    change = {q: after[q] - before[q] for q in ds.qids}
+    fixed = [q for q in ds.qids if before[q] < 0.3 and after[q] > 0.7]
+    lost = [q for q in ds.qids if before[q] > 0.7 and after[q] < 0.3]
+    print(f"{ds.name}: nDCG@10 {np.mean(list(before.values())):.3f} before, {np.mean(list(after.values())):.3f} after; better {sum(c > 0 for c in change.values())}, "
+          f"worse {sum(c < 0 for c in change.values())} of {len(change)} questions; "
+          f"fixed {len(fixed)}, broken {len(lost)} (from below 0.3 to above 0.7, or back)\n")
+    if broken:
+        return min(lost or ds.qids, key=change.get)
+    return max(fixed or ds.qids, key=change.get)
 
 
 def show(ds: Dataset, qid: str, runs: dict[str, np.ndarray], k: int = 5, chars: int = 90) -> None:
@@ -482,6 +710,64 @@ OWNERS = ("Maria Virtanen", "Jonas Berg", "Anna Schmidt", "Lars Nilsen", "Sofia 
 PRODUCTS = ("Analytics Suite", "Data Platform", "Security Add-on", "Support Plus", "Mobile SDK", "Integration Hub",
             "AI Assistant", "Onboarding Services")
 LEAD_SOURCES = ("Website", "Referral", "Partner", "Trade show", "Cold outreach", "Webinar", "Inbound call", "LinkedIn ad")
+DESCRIPTIONS = {  # (field, value) -> words people use for it, so that value search has something to match
+    **{("country", c): d for c, d in {
+        "Finland": "Nordic country, Nordics, Scandinavia, Northern Europe, EU, Helsinki",
+        "Sweden": "Nordic country, Nordics, Scandinavia, Northern Europe, EU, Stockholm",
+        "Norway": "Nordic country, Nordics, Scandinavia, Northern Europe, Oslo",
+        "Denmark": "Nordic country, Nordics, Scandinavia, Northern Europe, EU, Copenhagen",
+        "Iceland": "Nordic country, Nordics, Northern Europe, Reykjavik",
+        "Estonia": "Baltic country, Baltics, Northern Europe, EU, Tallinn",
+        "Germany": "DACH, German-speaking, Central Europe, EU, Berlin, Munich",
+        "Austria": "DACH, German-speaking, Central Europe, EU, Vienna",
+        "Switzerland": "DACH, German-speaking, Central Europe, Zurich, Geneva",
+        "Netherlands": "Benelux, Holland, Western Europe, EU, Amsterdam",
+        "Belgium": "Benelux, Western Europe, EU, Brussels",
+        "France": "Western Europe, EU, Paris", "Spain": "Southern Europe, Iberia, EU, Madrid",
+        "Italy": "Southern Europe, EU, Milan, Rome", "Portugal": "Southern Europe, Iberia, EU, Lisbon",
+        "Poland": "Central and Eastern Europe, CEE, EU, Warsaw", "Czechia": "Czech Republic, Central Europe, CEE, EU, Prague",
+        "Ireland": "British Isles, Western Europe, EU, Dublin", "United Kingdom": "UK, Britain, England, British Isles, London",
+        "United States": "USA, US, America, North America", "Canada": "North America, Toronto",
+        "Brazil": "Latin America, South America, LATAM, Sao Paulo", "Japan": "Asia, APAC, Tokyo",
+        "Singapore": "Asia, APAC, Southeast Asia", "Australia": "APAC, Oceania, Sydney"}.items()},
+    **{("industry", i): d for i, d in {
+        "Financial services": "banks, banking, fintech, payments, lending, asset management",
+        "Insurance": "insurers, insurtech, underwriting, claims", "Healthcare": "hospitals, clinics, health care, medical",
+        "Pharmaceuticals": "pharma, drug makers, life sciences, biotech", "Retail": "shops, stores, retailers, consumer goods",
+        "E-commerce": "online stores, online retail, webshops", "Logistics": "shipping, freight, transport, supply chain",
+        "Manufacturing": "factories, industrial, production", "Automotive": "car makers, cars, vehicles, auto industry",
+        "Energy": "utilities, power, oil and gas, renewables", "Telecommunications": "telcos, telecom, mobile operators",
+        "Media": "publishing, broadcasting, news, entertainment", "Education": "schools, universities, edtech",
+        "Public sector": "government, municipalities, public administration, agencies",
+        "Real estate": "property, proptech, landlords", "Construction": "builders, building, contractors, engineering",
+        "Hospitality": "hotels, restaurants, travel, tourism", "Agriculture": "farming, agri, food production",
+        "Software": "SaaS, tech companies, IT", "Legal services": "law firms, lawyers, legal"}.items()},
+    **{("stage", st): d for st, d in {
+        "Prospecting": "early stage, first contact, lead, top of the funnel, open",
+        "Qualification": "early stage, qualifying the lead, open", "Discovery": "mid stage, needs analysis, open",
+        "Proposal": "mid stage, quote sent, offer, open", "Negotiation": "late stage, agreeing price and terms, open",
+        "Contract sent": "late stage, contract out for signature, about to sign, open",
+        "Closed won": "won, signed, customer, closed", "Closed lost": "lost, dead, churned, closed"}.items()},
+    **{("owner", o): f"salesperson, account owner, sales rep, {o.split()[0]}" for o in OWNERS},
+    **{("product", pr): d for pr, d in {
+        "Analytics Suite": "reporting, dashboards, BI", "Data Platform": "data warehouse, data lake, pipelines",
+        "Security Add-on": "security, compliance, access control", "Support Plus": "premium support, service level",
+        "Mobile SDK": "mobile apps, iOS, Android", "Integration Hub": "integrations, connectors, APIs",
+        "AI Assistant": "AI, machine learning, chatbot, GenAI", "Onboarding Services": "implementation, training, setup"}.items()},
+    **{("lead_source", ls): d for ls, d in {
+        "Website": "web form, inbound, site", "Referral": "recommended by a customer, word of mouth",
+        "Partner": "reseller, channel partner", "Trade show": "conference, expo, event, fair",
+        "Cold outreach": "cold call, cold email, outbound", "Webinar": "online event, web seminar",
+        "Inbound call": "phone, called us", "LinkedIn ad": "social media ad, LinkedIn, paid ads"}.items()},
+}
+FIELD_DESCRIPTIONS = {
+    "amount_eur": "the value of the deal in euros: deal size, how big, biggest, largest, smallest, worth, value, price",
+    "annual_revenue_eur": "the customer company's yearly revenue in euros: turnover, company size, how big the company is",
+    "employees": "how many people work at the customer company: headcount, staff, company size",
+    "probability": "the chance of winning the deal, 0 to 1, set by its stage: likelihood, win rate, how likely",
+    "close_date": "the date the deal closed or is expected to close: closing, due, deadline, signing date",
+    "last_activity_date": "the date of the latest call, email or meeting with the customer: last contact, last touch, "
+                          "recent, gone quiet, stale, no contact since"}
 _NAME = (("Aurora", "Boreal", "Cedar", "Delta", "Ember", "Fjord", "Granite", "Harbor", "Iris", "Juniper", "Kestrel",
           "Lumen", "Meridian", "Nordvik", "Orion", "Polar", "Quartz", "Riverstone", "Sable", "Tundra", "Umbra", "Vega",
           "Willow", "Zenith", "Alder", "Birch", "Coral", "Dune", "Elm", "Falcon"),
@@ -529,6 +815,43 @@ def crm(n: int = 600, seed: int = 0) -> list[dict]:
                           lead_source=str(rng.choice(LEAD_SOURCES)), notes=" ".join(notes)))
     return deals
 
+
+
+CATEGORIES = ("industry", "country", "stage", "owner", "product", "lead_source")
+
+
+
+def embeddings() -> dict[str, np.ndarray]:
+    """Precomputed pplx vectors (the lab's question encoder) of the texts the advanced sections embed, by text, from
+    the data's embeddings.npz; texts missing here are embedded by the lab."""
+    path = fetch() / "embeddings.npz"
+    if not path.exists():
+        return {}
+    z = np.load(path)
+    return dict(zip(z["texts"].tolist(), z["vectors"].astype(np.float32)))
+
+def deal_text(d: dict) -> str:
+    """A deal as a document: its notes, then its attributes in words, so that plain search can find them too."""
+    return d["notes"] + " " + "; ".join(f"{f.replace('_', ' ')}: {d[f]}" for f in d if f not in ("deal_id", "company", "notes")) + "."
+
+
+def documents(name: str) -> tuple[list[str], list[str], list[str]]:
+    """(ids, titles, texts) of the advanced sections' small datasets: "crm" (the deals), "crm-values" (every value of
+    the category fields, described), "crm-fields" (the number and date fields, described), "tools" (tool_catalog())."""
+    if name == "crm":
+        deals = crm()
+        return [d["deal_id"] for d in deals], [d["company"] for d in deals], [deal_text(d) for d in deals]
+    if name == "crm-values":
+        deals = crm()
+        values = [(f, v) for f in CATEGORIES for v in sorted({d[f] for d in deals})]
+        return [f"{f}={v}" for f, v in values], [f"{f.replace('_', ' ')}: {v}" for f, v in values], [DESCRIPTIONS[f, v] for f, v in values]
+    if name == "crm-fields":
+        return list(FIELD_DESCRIPTIONS), [f.replace("_", " ") for f in FIELD_DESCRIPTIONS], list(FIELD_DESCRIPTIONS.values())
+    if name == "tools":
+        fns = [t["function"] for t in tool_catalog()]
+        return ([f["name"] for f in fns], [f["name"].replace("_", " ") for f in fns],
+                [f"{f['description']} Parameters: {', '.join(f['parameters']['properties'])}." for f in fns])
+    raise ValueError(f"no dataset {name!r}")
 
 # ---- advanced: a catalog of tools
 
