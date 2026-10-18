@@ -7,6 +7,8 @@ matplotlib.rcParams["figure.max_open_warning"] = 0
 
 # %% [markdown]
 # ## 1. The data
+#
+# Two datasets. CAIQ: security questionnaire answers from several vendors; a question asks one vendor about one control, and the relevant documents are the answers to the same or related controls. FiQA: questions and answers from a personal finance forum. Every step below is measured with nDCG@10: how high the relevant documents are in the top 10, from 0 (none) to 1 (perfect).
 print('\n' + '== 1. The data ==')
 
 # %%
@@ -45,6 +47,8 @@ for ds in DATASETS:
 
 # %% [markdown]
 # ## 2. From text to terms
+#
+# A search engine does not see text. It sees terms. We lowercase the text, remove accents and split it into runs of letters and digits. Stopwords are frequent words that say little about the topic. A stemmer reduces each word to a common stem, so that "encrypted" and "encryption" match.
 print('\n' + '== 2. From text to terms ==')
 
 # %%
@@ -62,6 +66,8 @@ print("terms:    ", STEM.terms(" ".join(words))[0])
 
 # %% [markdown]
 # ## 3. An inverted index
+#
+# An inverted index is the core of lexical search. For each term it keeps the documents that contain it (the postings) and how often. A positional index also keeps the position of each occurrence, so we can find phrases. Every lexical step from here on uses this index.
 print('\n' + '== 3. An inverted index ==')
 
 # %%
@@ -83,6 +89,8 @@ for name, a in (("tokens", lab.TOKENS), ("without stopwords", STOP), ("stemmed",
 
 # %% [markdown]
 # ## 4. Matching words
+#
+# The simplest ranking: count how many of the question's words each document contains. Many documents tie, and common words count as much as rare ones.
 print('\n' + '== 4. Matching words ==')
 
 # %%
@@ -95,6 +103,8 @@ lab.show(caiq, caiq.qids[0], {"matching words": MATCH["caiq"]})
 
 # %% [markdown]
 # ## 5. Stopwords
+#
+# Remove the stopwords from the questions and the documents. Now a match on "the" or "how" no longer counts.
 print('\n' + '== 5. Stopwords ==')
 
 # %%
@@ -107,6 +117,8 @@ lab.plot_ladder(runs);
 
 # %% [markdown]
 # ## 6. TF-IDF
+#
+# TF-IDF gives each word a weight: rare words (high inverse document frequency) count more, and a word that occurs often in a document (term frequency) counts more. It fails here. Some documents repeat the same words hundreds of times, and TF-IDF rewards them without a limit.
 print('\n' + '== 6. TF-IDF ==')
 
 # %%
@@ -125,6 +137,8 @@ for d in lab.top(caiq, example, TFIDF["caiq"], 3):
 
 # %% [markdown]
 # ## 7. BM25
+#
+# BM25 fixes the two problems of TF-IDF. Each extra occurrence of a word adds less than the one before (k1 controls how fast this saturates), and long documents are scored down (b controls how much). The grid shows how the two parameters change the result.
 print('\n' + '== 7. BM25 ==')
 
 # %%
@@ -155,6 +169,8 @@ for ds in DATASETS:
 
 # %% [markdown]
 # ## 8. Stemming
+#
+# Index the stems instead of the words. A question about "rotating encryption keys" now matches "key rotation".
 print('\n' + '== 8. Stemming ==')
 
 # %%
@@ -167,6 +183,8 @@ lab.plot_ladder(runs);
 
 # %% [markdown]
 # ## 9. Add the title
+#
+# Add a second BM25 score for the document's title. The IDF of both fields comes from title and text together, so a rare word has the same weight in both fields. In CAIQ the title holds the control, so it helps a lot; FiQA has almost no titles.
 print('\n' + '== 9. Add the title ==')
 
 # %%
@@ -188,6 +206,8 @@ lab.show(caiq, example, {"+ stemming": STEMMED["caiq"], "+ title": TEXT["caiq"] 
 
 # %% [markdown]
 # ## 10. Synonyms
+#
+# A synonym list maps phrases that mean the same ("data loss prevention" and "DLP"). At query time, each synonym phrase in the question scores as its best-matching alternative in each document. A synonym never counts more than the question's own wording. This small list was selected on these questions, so its gain here is partly fitted; on new FiQA questions it neither helps nor hurts.
 print('\n' + '== 10. Synonyms ==')
 
 # %%
@@ -213,6 +233,8 @@ lab.plot_ladder(runs);
 
 # %% [markdown]
 # ## 11. Let's look at the top matches
+#
+# Look at what the ranking puts at the top. Some documents are long and repeat the same few sentences. They match many words and rank high for many questions.
 print('\n' + "== 11. Let's look at the top matches ==")
 
 # %%
@@ -244,6 +266,8 @@ for ds in DATASETS:
 
 # %% [markdown]
 # ## 12. Saturated BM25
+#
+# Saturate each field's score: score / (S + score). No field can then dominate, and a document with a very high text score cannot push out a document that matches well in both fields.
 print('\n' + '== 12. Saturated BM25 ==')
 
 # %%
@@ -273,6 +297,8 @@ lab.show(caiq, example, {"+ synonyms": TEXT["caiq"] + TITLE["caiq"], "saturated"
 
 # %% [markdown]
 # ## 13. Phrase match
+#
+# Phrase match: the share of the question's neighbouring word pairs that also occur next to each other in the document. It uses the positions in the index. We add it to the score with a small weight.
 print('\n' + '== 13. Phrase match ==')
 
 # %%
@@ -303,6 +329,8 @@ lab.show(fiqa, example, {"saturated": saturated(fiqa, S), "+ phrase": lexical(fi
 
 # %% [markdown]
 # ## 14. Learning to rank
+#
+# Learning to rank replaces hand-picked weights with learned ones. The features are the lexical scores of the top 50 documents. A linear model trained with LambdaRank gives one weight per feature (never negative); LightGBM learns a tree model. Both are trained on some questions and tested on others (5-fold cross-validation). The importance table shows which features matter.
 print('\n' + '== 14. Learning to rank ==')
 
 # %%
@@ -380,6 +408,8 @@ lab.show(caiq, example, {"+ phrase": lexical(caiq), "learning to rank": lab.expa
 
 # %% [markdown]
 # ## 15. Dense embeddings
+#
+# Dense embeddings map a question and a document to vectors, so that similar meanings are close even with no shared words. Cosine similarity ranks the documents. Adding the dense score to the lexical score needs care: the raw scores have very different scales. Reciprocal rank fusion (RRF) combines ranks instead of scores.
 print('\n' + '== 15. Dense embeddings ==')
 
 # %%
@@ -438,6 +468,8 @@ lab.show(fiqa, example, {"+ phrase": lexical(fiqa), "+ dense": hybrid(fiqa)})
 
 # %% [markdown]
 # ## 16. Long documents
+#
+# An embedding model reads only so many tokens. With a 512-token window, a long document is cut, and its vector describes only its start. A long-context model reads the whole document, which also changes how the repeated, irrelevant documents rank.
 print('\n' + '== 16. Long documents ==')
 
 # %%
@@ -482,6 +514,8 @@ lab.show(fiqa, climbed[0], {"512 tokens": COS512["fiqa"], "whole document": COS[
 
 # %% [markdown]
 # ## 17. Binary embeddings
+#
+# Store each document vector as bits: one bit per dimension, the sign. This is 32 times smaller than float32. Centering the vectors first (subtracting the mean) keeps more information. The question can stay a float vector. The first stage takes the top 20 from the bits and the top 20 from the lexical score, and scores them with both.
 print('\n' + '== 17. Binary embeddings ==')
 
 # %%
@@ -540,7 +574,7 @@ lab.plot_ladder(runs);
 print('\n' + '== 18. Late interaction ==')
 
 # %% [markdown]
-# Late interaction (ColBERT) keeps one vector per token and matches each question token to its best document token. Its value depends on the model and dataset: LateOn improves FiQA, but contributes almost nothing on CAIQ. This section compares three precomputed models with Perplexity's new v2 0.6B model.
+# Late interaction (ColBERT) keeps one vector per token and matches each question token to its best document token (MaxSim). It stores many vectors per document, so it reranks only the top 20 of the first stage. We use Perplexity's pplx-embed-v2-late-0.6b, stored as int8 or as bits, and mix its score with the first stage.
 
 # %%
 STEP5 = {ds.name: np.where(CAND[ds.name], hybrid_bits(ds), -np.inf) for ds in DATASETS}
@@ -601,6 +635,8 @@ for ds in DATASETS:
 
 # %% [markdown]
 # ## 19. Cross-encoder
+#
+# A cross-encoder reads the question and the document together and gives a relevance score. It is the most accurate step, and the most expensive, so it scores only the top 20 of the first stage. The lab server calls Qwen3-Reranker-8B and Voyage rerank-3 for you; the scores of the notebook's top 20 are cached.
 print('\n' + '== 19. Cross-encoder ==')
 
 # %%
@@ -640,6 +676,8 @@ lab.show(caiq, example, {"binary first stage": STEP5["caiq"],
 
 # %% [markdown]
 # ## 20. How sure are we?
+#
+# A mean over 119 or 648 questions has noise. The bootstrap resamples the questions many times and gives a 95% interval for the mean. For the change between two steps, we resample the same questions for both steps (a paired comparison), which gives a much narrower interval.
 print('\n' + '== 20. How sure are we? ==')
 
 # %%
@@ -675,6 +713,8 @@ fig.tight_layout()
 
 # %% [markdown]
 # ## 21. Debugging failing questions
+#
+# List the questions where the final ranking fails, and ask why. If no relevant document is among the 20 candidates, the first stage failed and the reranker cannot help. If a relevant document is a candidate but ranks low, the ranking failed.
 print('\n' + '== 21. Debugging failing questions ==')
 
 # %%
@@ -695,6 +735,8 @@ lab.show(caiq, worst, {"binary first stage": STEP5["caiq"], "+ cross-encoder": l
 
 # %% [markdown]
 # ## 22. Leaderboard
+#
+# The leaderboard scores your search on FiQA questions that are not in the notebook. Write a function that searches for one new question, and submit it. The lab's own search, the full ladder, is the entry to beat.
 print('\n' + '== 22. Leaderboard ==')
 
 # %%
@@ -760,6 +802,8 @@ for label, fn in (("bm25", bm25_search), ("the ladder", search)):
 
 # %% [markdown]
 # ## 23. A RAG agent from scratch
+#
+# An agent uses search as a tool. It decides what to search for, reads the results and answers. The lab server gives you an OpenAI-compatible API with Claude Haiku. We compare a single search (RAG) with an agent that can search many times, each with the plain BM25 search and with the full ladder. A judge model grades the answers.
 print('\n' + '== 23. A RAG agent from scratch ==')
 
 # %%
@@ -882,6 +926,8 @@ for method in ("rag", "agent"):
 
 # %% [markdown]
 # ## 24. Code mode
+#
+# In code mode, the agent writes Python that calls search, instead of calling one tool at a time. It can loop over several queries and filter the results in one step.
 print('\n' + '== 24. Code mode ==')
 
 # %%
@@ -1006,6 +1052,8 @@ print(f"\ncode_agent − agent: {diff.mean():+.3f} (95% interval {lo:+.3f} to {h
 
 # %% [markdown]
 # ## 25. Filters, sorting and counts
+#
+# Many questions are not about meaning but about attributes: country, stage, owner, dates. A fake CRM of 600 deals has both. The same search gets filters, sorting and counts. The agent also needs to find the right values ("fintech" is "Financial services") and fields, and it finds them with the same search over value and field descriptions. Each question has an exact answer, so we can count correct answers.
 print('\n' + '== 25. Filters, sorting and counts ==')
 
 # %%
@@ -1227,6 +1275,8 @@ print(f"\ncost {run['usd']:.4f}")
 
 # %% [markdown]
 # ## 26. Tool search
+#
+# An agent with 60 tools cannot read every tool description in each request. Tool search indexes the tool descriptions and finds the right tools for the task, with the same search as the documents.
 print('\n' + '== 26. Tool search ==')
 
 # %%
