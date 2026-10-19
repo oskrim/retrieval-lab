@@ -611,7 +611,7 @@ def rerank(ds: Dataset, top: np.ndarray, model: str) -> np.ndarray:
 
 
 def submit(ds: Dataset, search_with, label: str) -> dict:
-    """Runs search_with(ds, question, k=10) (document rows, best first) on the leaderboard's hidden FiQA questions and
+    """Runs search_with(ds, question, k=10) (document rows, best first) on the leaderboard's FiQA questions (not in the data) and
     sends the results; the lab scores mean nDCG@10 and keeps your best. label: a few words on what your search does."""
     qs = call("/api/board/questions")["questions"]
     first = search_with(ds, qs[0]["text"], k=10)  # builds the search's indexes once, before the threads start
@@ -621,7 +621,7 @@ def submit(ds: Dataset, search_with, label: str) -> dict:
 
 
 def submit_agent(answer_with, label: str) -> dict:
-    """Runs answer_with(question) (a set of deal ids) on the agent leaderboard's hidden CRM questions and sends the
+    """Runs answer_with(question) (a set of deal ids) on the agent leaderboard's CRM questions and sends the
     answers; the lab scores the share answered exactly and keeps your best. label: a few words on what your agent does."""
     qs = call("/api/agent-board/questions")["questions"]
     with ThreadPoolExecutor(8) as pool:
