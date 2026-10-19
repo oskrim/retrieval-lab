@@ -631,7 +631,7 @@ def submit_agent(answer_with, label: str) -> dict:
 
 # ---- plots and examples
 
-def plot_ladder(runs: dict[str, dict[str, dict[str, float]]]):
+def plot_progress(runs: dict[str, dict[str, dict[str, float]]]):
     """One panel per dataset: each step's mean nDCG@10 with a 95% interval, and its change from the step before."""
     import matplotlib.pyplot as plt
 
@@ -655,12 +655,12 @@ def plot_ladder(runs: dict[str, dict[str, dict[str, float]]]):
     axes[0][0].set_ylim(len(steps) - 0.5, -0.8)
     axes[0][0].set_yticks(range(len(steps)), steps)
     fig.tight_layout()
-    print_ladder(runs)
+    print_progress(runs)
     return fig
 
 
-def print_ladder(runs: dict[str, dict[str, dict[str, float]]]) -> None:
-    """The ladder as a table: each step's mean nDCG@10 per dataset and its change from the step before."""
+def print_progress(runs: dict[str, dict[str, dict[str, float]]]) -> None:
+    """The progress as a table: each step's mean nDCG@10 per dataset and its change from the step before."""
     steps = list(dict.fromkeys(step for r in runs.values() for step in r))
     width = max(map(len, steps)) + 2
     print(" " * width + "".join(f"{name:>10s}{'':9s}" for name in runs))
