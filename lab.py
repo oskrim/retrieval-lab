@@ -598,8 +598,7 @@ def call(path: str, body: dict | None = None) -> dict:
 
 
 def rerank(ds: Dataset, top: np.ndarray, model: str) -> np.ndarray:
-    """Cross-encoder scores for the documents in top (questions × k document indices). model: "qwen3-reranker-8b" or
-    "voyage-rerank-3"."""
+    """Cross-encoder scores for the documents in top (questions × k document indices). model: "voyage-rerank-3"."""
     out = np.empty(top.shape, dtype=np.float32)
 
     def one(r: int) -> None:
