@@ -755,9 +755,8 @@ def post(url, key, body):
         raise RuntimeError(f"{e.code}: {e.read().decode(errors='replace')}") from None
 
 def embed(text):
-    """The question's pplx vector from the lab: it must match the documents' vectors."""
-    r = post(f"{LAB['url']}/v1/embeddings", LAB["token"], dict(model="pplx-embed", input=[text]))
-    return np.array(r["data"][0]["embedding"], dtype=np.float32)[None]
+    """The question's pplx vector, from the encoder that made the documents' vectors (on your machine)."""
+    return lab.embed([text])
 
 # %%
 DOC_BITS = {name: (d.mean(0), signs(d - d.mean(0))) for name, (d, _) in VEC.items()}
@@ -1059,16 +1058,12 @@ for d in DEALS[:3]:
     print(json.dumps(d, ensure_ascii=False), "\n")
 
 # %%
-VECS = lab.embeddings()  # precomputed with the data; anything else is embedded by the lab
+VECS = lab.embeddings()  # precomputed with the data; anything else is embedded here
 
 def embed_many(texts):
-    """Unit pplx vectors of texts, 16 per request; each text is embedded once."""
+    """Unit pplx vectors of texts; each text is embedded once."""
     new = list(dict.fromkeys(t for t in texts if t not in VECS))
-    for a in range(0, len(new), 16):
-        r = post(f"{LAB['url']}/v1/embeddings", LAB["token"], dict(model="pplx-embed", input=new[a:a + 16]))
-        for t, e in zip(new[a:a + 16], sorted(r["data"], key=lambda e: e["index"])):
-            v = np.array(e["embedding"], dtype=np.float32)
-            VECS[t] = v / np.linalg.norm(v)
+    VECS.update(zip(new, lab.embed(new)))
     return np.stack([VECS[t] for t in texts])
 
 def index(name):
@@ -1265,7 +1260,7 @@ CATALOG = lab.tool_catalog()
 TOOL_NAMES = [t["function"]["name"] for t in CATALOG]
 TOOLS_DS = index("tools")
 TASKS = [task for task, _ in lab.TOOL_TASKS]
-embed_many(TASKS)  # one batch of requests instead of one per task
+embed_many(TASKS)  # one batch instead of one per task
 
 def find_tools(how, query, k=5):
     """The k best tools for query: bm25 alone, dense alone, or the ladder's first stage (search without reranking)."""

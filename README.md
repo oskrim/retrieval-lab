@@ -3,12 +3,14 @@
 `lab.ipynb` improves one ranking step by step on two datasets, measuring every step. `lab.py` holds the helpers.
 Python 3.10 or newer (on Ubuntu: `sudo apt install python3-venv`). Your lab page shows these with your URL and token.
 
-Without a GPU (laptop): downloads the data with every precomputed vector, about 1.3 GB; do it before the workshop
-if you can.
+Without a GPU (laptop): downloads the data with every precomputed vector (about 1.3 GB) and the question encoder
+(1.2 GB); do it before the workshop if you can. The first pip line installs the CPU build of torch, which skips
+about 3 GB of GPU libraries on Linux.
 
 ```bash
 git clone https://github.com/oskrim/retrieval-lab && cd retrieval-lab
 python3 -m venv .venv
+.venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python lab.py fetch
 .venv/bin/python lab.py connect URL TOKEN

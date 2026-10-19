@@ -1,7 +1,8 @@
 """Helpers for lab.ipynb: the data, BM25, score matrices, nDCG@10, plots, and the lab's reranking API.
 Plain Python and numpy.
 
-  python3 lab.py fetch                  downloads the data, with every precomputed vector, into ./data
+  python3 lab.py fetch                  downloads the data, with every precomputed vector, into ./data, and the
+                                        question encoder (embed) into the Hugging Face cache
   python3 lab.py connect URL TOKEN      saves the lab URL and your token (both on your lab page) in .lab.json
   python3 lab.py terminal               writes lab_terminal.py, the notebook as one Python file for a terminal
 """
@@ -15,6 +16,7 @@ import pathlib
 import re
 import sys
 import tarfile
+import threading
 import unicodedata
 import urllib.error
 import urllib.request
@@ -29,6 +31,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 DATA = HERE / "data"
 RELEASE = "https://github.com/oskrim/retrieval-lab/releases/download/data-v8"
 LATE_MODEL = "perplexity-ai/pplx-embed-v2-late-0.6b"
+QUERY_MODEL, QUERY_REVISION = "perplexity-ai/pplx-embed-v1-0.6b", "2c4d510dd4a732063c31a0f70193e35067b51fd8"
 LAB = HERE / ".lab.json"
 
 
@@ -833,13 +836,37 @@ CATEGORIES = ("industry", "country", "stage", "owner", "product", "lead_source")
 
 
 def embeddings() -> dict[str, np.ndarray]:
-    """Precomputed pplx vectors (the lab's question encoder) of the texts the advanced sections embed, by text, from
-    the data's embeddings.npz; texts missing here are embedded by the lab."""
+    """Precomputed pplx vectors (the question encoder, embed) of the texts the advanced sections embed, by text, from
+    the data's embeddings.npz; embed makes the rest."""
     path = fetch() / "embeddings.npz"
     if not path.exists():
         return {}
     z = np.load(path)
     return dict(zip(z["texts"].tolist(), z["vectors"].astype(np.float32)))
+
+_ENCODER: list = []  # the loaded question encoder, once
+_ENCODER_LOCK = threading.Lock()
+
+
+def embed(texts: list[str]) -> np.ndarray:
+    """Unit pplx vectors of texts, made the way the data's question vectors were: pplx-embed-v1-0.6b (a 1.2 GB download
+    on first use) on your GPU if you have one, else the CPU; mean pooling over at most 512 tokens, float32."""
+    if not texts:
+        return np.zeros((0, 1024), dtype=np.float32)
+    import torch  # loaded on the first question only
+    from sentence_transformers import SentenceTransformer
+
+    with _ENCODER_LOCK:
+        if not _ENCODER:
+            full = SentenceTransformer(QUERY_MODEL, revision=QUERY_REVISION, trust_remote_code=True, device="cpu",
+                                       model_kwargs={"torch_dtype": torch.float32})
+            model = SentenceTransformer(modules=[full[0], full[1]], device="cuda" if torch.cuda.is_available() else "cpu")
+            model.max_seq_length = 512  # the transformer and the mean pooling, without the model's int8 step
+            _ENCODER.append(model.eval())
+        v = _ENCODER[0].encode(list(texts), batch_size=16, convert_to_numpy=True, normalize_embeddings=True)
+    assert v.ndim == 2 and len(v) == len(texts) and np.isfinite(v).all(), "pplx produced no usable vectors"
+    return v.astype(np.float32)
+
 
 def deal_text(d: dict) -> str:
     """A deal as a document: its notes, then its attributes in words, so that plain search can find them too."""
@@ -1014,5 +1041,7 @@ if __name__ == "__main__":
         print(f"wrote {terminal()}")
     elif sys.argv[1:] == ["fetch"]:
         print(f"data in {fetch()}")
+        from huggingface_hub import snapshot_download
+        print(f"question encoder in {snapshot_download(QUERY_MODEL, revision=QUERY_REVISION)}")
     else:
         sys.exit(__doc__)
