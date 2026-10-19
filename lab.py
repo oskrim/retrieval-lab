@@ -41,15 +41,15 @@ class Dataset:
     name: str
     ids: list[str]
     titles: list[str]
-    texts: list[str]
+    bodies: list[str]
     queries: dict[str, str]  # question id -> text
     qrels: dict[str, dict[str, int]]  # question id -> doc id -> relevance grade (1 or 2)
     hidden: dict[str, set[str]]  # question id -> doc ids the question may not retrieve (its own answer and copies)
-    title_text: list[str] | None = None  # each document's title and text together (the IDF of every field); built once
+    title_body: list[str] | None = None  # each document's title and body together (the IDF of every field); built once
 
     def __post_init__(self) -> None:
-        if self.title_text is None:
-            self.title_text = [f"{t} {x}" for t, x in zip(self.titles, self.texts)]
+        if self.title_body is None:
+            self.title_body = [f"{t} {x}" for t, x in zip(self.titles, self.bodies)]
         self.row = {d: i for i, d in enumerate(self.ids)}
         self.qids = list(self.queries)  # the row order of every score matrix
         self.qrow = {q: i for i, q in enumerate(self.qids)}
@@ -87,8 +87,8 @@ def load(name: str, split: str = "test") -> Dataset:
 def single(ds: Dataset, text: str, qid: str | None = None) -> Dataset:
     """The dataset with one question, text; with qid, it hides the documents question qid hides and keeps its grades."""
     key = qid or "question"
-    return Dataset(ds.name, ds.ids, ds.titles, ds.texts, {key: text}, {key: ds.qrels.get(qid, {})},
-                   {key: ds.hidden.get(qid, set())}, ds.title_text)
+    return Dataset(ds.name, ds.ids, ds.titles, ds.bodies, {key: text}, {key: ds.qrels.get(qid, {})},
+                   {key: ds.hidden.get(qid, set())}, ds.title_body)
 
 
 # ---- text: normalizing, tokens, terms
@@ -698,7 +698,7 @@ def show(ds: Dataset, qid: str, runs: dict[str, np.ndarray], k: int = 5, chars: 
         ranked = top(ds, qid, scores, k)
         print(f"{name}  nDCG@10 {ndcg10(top(ds, qid, scores), ds.qrels[qid]):.3f}")
         for i, d in enumerate(ranked, 1):
-            text = " ".join(f"{ds.titles[ds.row[d]]} {ds.texts[ds.row[d]]}".split())
+            text = " ".join(f"{ds.titles[ds.row[d]]} {ds.bodies[ds.row[d]]}".split())
             g = ds.qrels[qid].get(d, 0)
             print(f"  {i}. [{g or '.'}] {d:<14} {text[:chars]}{'…' if len(text) > chars else ''}")
         print()
@@ -872,7 +872,7 @@ def deal_text(d: dict) -> str:
 
 
 def documents(name: str) -> tuple[list[str], list[str], list[str]]:
-    """(ids, titles, texts) of the advanced sections' small datasets: "crm" (the deals), "crm-values" (every value of
+    """(ids, titles, bodies) of the advanced sections' small datasets: "crm" (the deals), "crm-values" (every value of
     the category fields, described), "crm-fields" (the number and date fields, described), "tools" (tool_catalog())."""
     if name == "crm":
         deals = crm()
