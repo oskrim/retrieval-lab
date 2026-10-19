@@ -29,5 +29,5 @@ python3 -m venv .venv
 .venv/bin/jupyter lab lab.ipynb
 ```
 
-On a remote machine (for example a Verda GPU box), start Jupyter with `.venv/bin/jupyter lab --no-browser lab.ipynb`,
+On a remote machine, start Jupyter with `.venv/bin/jupyter lab --no-browser lab.ipynb`,
 then run `ssh -L 8888:localhost:8888 USER@MACHINE` on your laptop and open the `http://localhost:8888/...` link it printed.
