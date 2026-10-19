@@ -17,10 +17,6 @@ python3 -m venv .venv
 .venv/bin/jupyter lab lab.ipynb
 ```
 
-In a terminal, without Jupyter: the same steps, then `.venv/bin/ipython -i lab_terminal.py`. It runs the whole notebook,
-printing each section's numbers (charts are off), and leaves you in IPython with every variable to explore.
-`lab_terminal.py` is generated from the notebook with `python3 lab.py terminal`.
-
 With a GPU: the same download; set `ENCODE_ON_GPU = True` in the notebook's first cell and it encodes the
 late-interaction token vectors again itself (about 10 minutes on an RTX 3090).
 
