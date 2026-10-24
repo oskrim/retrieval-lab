@@ -455,6 +455,11 @@ def cmd_setup(args) -> None:
     if cache is None:
         console.print(f"[warn]![/] the release has no {lab.rerank_cache_name()} yet; "
                       + ("the reranker scores on the GPU" if found else "unscored pairs rank lowest"))
+    with console.status("building the search indexes (once; lab eval reads them from data/cache)"):
+        for name, split in EVAL_SETS:
+            ds = lab.load(name, split)
+            lab.hybrid(ds, ds.queries[ds.qids[0]])
+    ok("search indexes")
 
     from huggingface_hub import snapshot_download
 
