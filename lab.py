@@ -26,6 +26,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import snowballstemmer
+from rich.progress import track
 
 HERE = pathlib.Path(__file__).resolve().parent
 DATA = HERE / "data"
@@ -692,19 +693,6 @@ def chat(messages: list[dict], tools=(), tool_choice: str = "auto") -> dict:
     return post(url, body, headers, timeout=600)
 
 
-def rerank(ds: Dataset, top: np.ndarray, model: str) -> np.ndarray:
-    """Cross-encoder scores for the documents in top (questions × k document indices). model: "voyage-rerank-3"."""
-    out = np.empty(top.shape, dtype=np.float32)
-
-    def one(r: int) -> None:
-        res = call("/api/rerank", dict(d=ds.name, q=ds.queries[ds.qids[r]], doc_ids=[ds.ids[i] for i in top[r]], model=model))
-        out[r] = res["scores"]
-
-    with ThreadPoolExecutor(8) as pool:
-        list(pool.map(one, range(len(ds.qids))))
-    return out
-
-
 # ---- one question at a time: the notebook's search as functions, and the local reranker
 
 SEARCH_ANALYZER = Analyzer(stopwords=True, stemming=True, synonyms=synonyms())
@@ -895,6 +883,14 @@ def rerank_local(ds: Dataset, question: str, rows, model: str = RERANK_MODEL, de
                 db.executemany("INSERT OR REPLACE INTO scores VALUES (?, ?, ?, ?)", [(model, question, d, s) for d, s in zip(batch, odds)])
             db.commit()
     return np.array([known[d] for d in ids], dtype=np.float32)
+
+
+def rerank_rows(ds: Dataset, top: np.ndarray, model: str = RERANK_MODEL) -> np.ndarray:
+    """rerank_local's scores for ds's questions: row r holds the scores of the documents in top[r] for question r."""
+    out = np.empty(top.shape, dtype=np.float32)
+    for r in track(range(len(ds.qids)), description=f"rerank {ds.name}"):
+        out[r] = rerank_local(ds, ds.queries[ds.qids[r]], top[r], model)
+    return out
 
 
 def submit(ds: Dataset, search_with, label: str) -> dict:
