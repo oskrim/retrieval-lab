@@ -41,6 +41,7 @@ VLLM_VERSION = "0.31.0"
 VLLM_ARGS = ("--max-model-len", "32768", "--gpu-memory-utilization", "0.6", "--enable-auto-tool-choice",
              "--tool-call-parser", "qwen3_coder", "--reasoning-parser", "qwen3")
 VLLM_URL = "http://localhost:8000/v1"
+AGENT_REQUEST: dict = {}  # extra request fields for the local agent model, e.g. its thinking switch
 LAB_AGENT_MODEL = "deepseek-v4-flash"  # the lab server's agent model, for machines without a GPU
 LAB = HERE / ".lab.json"
 
@@ -714,7 +715,8 @@ class ModelError(RuntimeError):
 def chat(messages: list[dict], tools=(), tool_choice: str = "auto") -> dict:
     """One reply of the agent model (agent_endpoint), in the OpenAI chat format."""
     url, headers, model = agent_endpoint()
-    body = dict(model=model, messages=messages, **(dict(tools=list(tools), tool_choice=tool_choice) if tools else {}))
+    body = dict(model=model, messages=messages, **(dict(tools=list(tools), tool_choice=tool_choice) if tools else {}),
+                **(AGENT_REQUEST if model == AGENT_MODEL else {}))
     try:
         return post(url, body, headers, timeout=600)
     except LabError as e:
