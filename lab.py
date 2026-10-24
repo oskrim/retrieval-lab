@@ -99,6 +99,7 @@ it its me my of on or our over should so than that the their them then there the
 when where which while who why will with would you your""".split())
 _STEMMER = snowballstemmer.stemmer("english")
 _STEMS: dict[str, str] = {}  # every word is stemmed once
+_STEM_LOCK = threading.Lock()  # the stemmer keeps its state between calls
 
 
 def normalize(text: str) -> str:
@@ -116,7 +117,8 @@ def tokenize(text: str) -> list[str]:
 def stem(word: str) -> str:
     """The word's Snowball (Porter 2) stem: encrypt, encrypted, encryption -> encrypt."""
     if word not in _STEMS:
-        _STEMS[word] = _STEMMER.stemWord(word)
+        with _STEM_LOCK:
+            _STEMS[word] = _STEMMER.stemWord(word)
     return _STEMS[word]
 
 
