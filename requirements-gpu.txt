@@ -1,2 +1,0 @@
-torchvision
-flash-linear-attention>=0.5

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retrieval-lab"
+version = "0.1.0"
+description = "The AaltoAI retrieval lab: the notebook's helpers and the lab CLI"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.0",
+    "matplotlib>=3.8",
+    "lightgbm>=4.3",
+    "jupyterlab>=4.2",
+    "ipython>=8.0",
+    "ipywidgets>=8.1",
+    "snowballstemmer>=2.2",
+    "torch>=2.5",
+    "torchvision",
+    "transformers>=5.4",
+    "sentence-transformers>=6.0",
+    "flash-linear-attention>=0.5",
+    "huggingface_hub>=1.0",
+    "rich>=13",
+]
+
+[project.scripts]
+lab = "cli:main"
+
+[tool.setuptools]
+py-modules = ["lab", "cli"]
