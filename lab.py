@@ -503,14 +503,25 @@ def vectors(ds: Dataset, window: int = 8192) -> tuple[np.ndarray, np.ndarray]:
     longer than 512 tokens the vector of their first 512 tokens, as an embedder with a 512-token window would."""
     if window not in (512, 8192):
         raise ValueError("window is 512 or 8192")
-    z = np.load(fetch() / ds.name / "vectors.npz")
+    return _doc_vectors(ds.name, window), _question_vectors(ds)
+
+
+def _unit(x: np.ndarray) -> np.ndarray:
+    return x / np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-12)
+
+
+def _doc_vectors(name: str, window: int = 8192) -> np.ndarray:
+    z = np.load(fetch() / name / "vectors.npz")
     docs = z["docs"].copy()
     if window == 512:
         docs[z["long"]] = z["truncated"]
+    return _unit(docs.astype(np.float32))
+
+
+def _question_vectors(ds: Dataset) -> np.ndarray:
     order = [json.loads(line)["id"] for line in open(fetch() / ds.name / "queries.jsonl")]
     qrow = {q: i for i, q in enumerate(order)}
-    unit = lambda x: x / np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-12)  # noqa: E731
-    return unit(docs.astype(np.float32)), unit(z["queries"][[qrow[q] for q in ds.qids]].astype(np.float32))
+    return _unit(np.load(fetch() / ds.name / "vectors.npz")["queries"][[qrow[q] for q in ds.qids]].astype(np.float32))
 
 
 @dataclass
@@ -822,18 +833,49 @@ _BUILD_LOCK = threading.RLock()
 
 
 def dense_parts(ds: Dataset) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
-    """ds's mean document vector, its documents as centered sign bits (±1), and the downloaded vectors of its questions
-    by text; built once per ds. Datasets without downloaded vectors embed their documents ("<title>\n<body>")."""
+    """ds's mean document vector, its documents' centered sign bits (pack_signs), and the downloaded vectors of its
+    questions by text; built once per ds. Datasets without downloaded vectors embed their documents ("<title>\n<body>")."""
     with _BUILD_LOCK:
         if id(ds) not in _DENSE:
             if (fetch() / ds.name / "vectors.npz").exists():
-                docs, qv = vectors(ds)
-                known = {ds.queries[q]: v for q, v in zip(ds.qids, qv)}
+                mean, bits = _downloaded_sign_bits(ds.name)
+                known = {ds.queries[q]: v for q, v in zip(ds.qids, _question_vectors(ds))}
             else:
                 docs, known = embed_many([f"{t}\n{x}" for t, x in zip(ds.titles, ds.bodies)]), {}
-            mean = docs.mean(0)
-            _DENSE[id(ds)] = (ds, mean, np.where(docs - mean >= 0, 1, -1).astype(np.float32), known)
+                mean = docs.mean(0)
+                bits = pack_signs(docs - mean >= 0)
+            _DENSE[id(ds)] = (ds, mean, bits, known)
         return _DENSE[id(ds)][1:]
+
+
+def pack_signs(positive: np.ndarray) -> np.ndarray:
+    """Sign bits (True: positive) packed 64 to a uint64 along the last axis, zero-padded."""
+    b = np.packbits(positive, axis=-1)
+    return np.pad(b, [(0, 0)] * (b.ndim - 1) + [(0, -b.shape[-1] % 8)]).view(np.uint64)
+
+
+def unpack_signs(bits: np.ndarray, dim: int) -> np.ndarray:
+    """pack_signs's bits as ±1 float32, dim per row."""
+    out = np.unpackbits(np.ascontiguousarray(bits).view(np.uint8), axis=-1, count=dim).view(np.int8).astype(np.float32)
+    out *= 2
+    out -= 1
+    return out
+
+
+def _downloaded_sign_bits(name: str) -> tuple[np.ndarray, np.ndarray]:
+    """The mean of dataset name's downloaded document vectors, and the documents' centered sign bits (pack_signs); kept
+    in DATA/cache, so only the first process reads the vectors."""
+    src = fetch() / name / "vectors.npz"
+    stat = src.stat()
+    how = (CACHE_FORMAT, DATA_VERSION, name, stat.st_size, stat.st_mtime_ns)
+
+    def build() -> dict[str, np.ndarray]:
+        docs = _doc_vectors(name)
+        mean = docs.mean(0)
+        return dict(mean=mean, bits=pack_signs(docs - mean >= 0))
+
+    a = _disk_cached(f"signs-{hashlib.sha256(repr(how).encode()).hexdigest()[:24]}", build)
+    return np.array(a["mean"]), a["bits"]
 
 
 def hybrid(ds: Dataset, question: str, bm25_weight: float = 1.0, dense_weight: float = 4.0, n: int = 100,
@@ -843,22 +885,36 @@ def hybrid(ds: Dataset, question: str, bm25_weight: float = 1.0, dense_weight: f
     bm25_weight · lexical + dense_weight · max(0, dense). lexical: saturated BM25 of body and title with stopwords,
     stemming and synonyms, plus 0.2 · phrase matches; dense: the question's pplx vector against the documents' centered
     sign bits. A question of ds keeps its hidden documents out; mask (one bool per document) searches only those."""
-    one = Dataset(ds.name, ds.ids, ds.titles, ds.bodies, {"q": question}, {"q": {}}, {"q": ds.hidden_by_text.get(question, set())},
-                  ds.title_body)
+    hidden = np.zeros(len(ds.ids), dtype=bool)
+    hidden[[ds.row[d] for d in ds.hidden_by_text.get(question, ()) if d in ds.row]] = True
     keep = np.ones(len(ds.ids), dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
     only = lambda s: np.where(keep, s, -np.inf)  # noqa: E731
-    body = bm25(one, ds.bodies, idf_texts=ds.title_body, analyzer=SEARCH_ANALYZER)
-    title = bm25(one, ds.titles, idf_texts=ds.title_body, analyzer=SEARCH_ANALYZER)
+    body = index(ds.bodies, SEARCH_ANALYZER, ds.title_body).bm25(question).astype(np.float32)
+    title = index(ds.titles, SEARCH_ANALYZER, ds.title_body).bm25(question).astype(np.float32)
     lexical = body / (SATURATION + body) + title / (SATURATION + title) + 0.2 * (
-        0.5 * phrase(one, ds.bodies, SEARCH_ANALYZER) + phrase(one, ds.titles, SEARCH_ANALYZER))
+        0.5 * index(ds.bodies, SEARCH_ANALYZER).phrase(question).astype(np.float32)
+        + index(ds.titles, SEARCH_ANALYZER).phrase(question).astype(np.float32))
     mean, bits, known = dense_parts(ds)
     q = (known[question] if question in known else embed([question])[0]) - mean
-    n = min(n, len(ds.ids))
-    cand = candidates(one, [only(np.where(q >= 0, 1, -1).astype(np.float32) @ bits.T)[None], only(body + title)], n)
-    dense = np.maximum(0, q @ bits.T / np.sqrt(bits.shape[1]))[None]
-    fused = np.where(cand & keep, dense_weight * dense + bm25_weight * lexical, -np.inf)
-    rows = topk(one, fused, n)[0]
-    return rows[np.isfinite(fused[0, rows])]
+    n, dim = min(n, len(ds.ids)), len(mean)
+    signs = dim - 2 * np.bitwise_count(bits ^ pack_signs(q >= 0)).sum(1, dtype=np.int64)  # sign(q) · each document's ±1
+    cand = np.zeros(len(ds.ids), dtype=bool)
+    for first in (only(signs.astype(np.float32)), only(body + title)):
+        cand[_top_row(first, hidden, n)] = True
+    scored = np.flatnonzero(cand & keep)
+    # a row sum, not a BLAS product: its value does not depend on the thread count or on which rows are scored
+    dense = np.maximum(0, (unpack_signs(bits[scored], dim) * q).sum(1) / np.sqrt(dim))
+    fused = np.full(len(ds.ids), -np.inf)
+    fused[scored] = dense_weight * dense + bm25_weight * lexical[scored]
+    rows = _top_row(fused, hidden, n)
+    return rows[np.isfinite(fused[rows])]
+
+
+def _top_row(scores: np.ndarray, hidden: np.ndarray, k: int) -> np.ndarray:
+    """topk for one row of scores: the k best positions, best first, the hidden ones scoring -inf."""
+    s = np.where(hidden, -np.inf, scores)
+    best = np.argpartition(-s, k - 1)[:k]
+    return best[np.argsort(-s[best], kind="stable")]
 
 
 def argsort_desc(scores) -> np.ndarray:
@@ -961,6 +1017,12 @@ def _rerank_db() -> sqlite3.Connection:
 
 
 def _cuda() -> bool:
+    """Whether torch sees a GPU. Without CUDA devices or an NVIDIA driver it cannot, and torch (a second to import)
+    stays unloaded."""
+    if os.environ.get("CUDA_VISIBLE_DEVICES", "0").strip() in ("", "-1") or sys.platform == "darwin":
+        return False
+    if sys.platform.startswith("linux") and not (os.path.exists("/proc/driver/nvidia") or os.path.exists("/dev/dxg")):
+        return False  # /dev/dxg: the GPU under WSL2
     import torch
 
     return torch.cuda.is_available()

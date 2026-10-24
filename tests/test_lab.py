@@ -217,3 +217,22 @@ def test_an_analyzer_subclass_keeps_its_index_in_memory_only(tmp_path, monkeypat
 
     assert lab.Index(["a b", "b c"], Upper()).vocab == {"A": 0, "B": 1, "C": 2}
     assert not (tmp_path / "cache").exists()
+
+
+def test_packed_sign_bits():
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(5, 100)).astype(np.float32)
+    bits = lab.pack_signs(x >= 0)
+    assert bits.dtype == np.uint64 and bits.shape == (5, 2)
+    signs = np.where(x >= 0, 1, -1).astype(np.float32)
+    assert np.array_equal(lab.unpack_signs(bits, 100), signs)
+    assert np.array_equal(lab.unpack_signs(bits[[3, 1]], 100), signs[[3, 1]])
+    q = rng.normal(size=100).astype(np.float32)
+    agree = 100 - 2 * np.bitwise_count(bits ^ lab.pack_signs(q >= 0)).sum(1, dtype=np.int64)
+    assert agree.tolist() == (signs @ np.where(q >= 0, 1, -1)).tolist()
+
+
+def test_no_cuda_devices_means_no_torch(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setitem(__import__("sys").modules, "torch", None)  # importing torch would raise
+    assert lab._cuda() is False
