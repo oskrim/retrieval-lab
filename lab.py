@@ -20,6 +20,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from array import array
@@ -934,6 +935,10 @@ _RERANK_LOCK = threading.Lock()
 rerank_misses = [0]  # pairs that scored lowest because they were in no cache and there was no GPU to score them
 
 
+class RerankCacheMiss(UserWarning):
+    """rerank_local scored pairs lowest: they were in no cache and there was no GPU to score them."""
+
+
 def rerank_cache_name(model: str = RERANK_MODEL) -> str:
     """The file name of model's precomputed scores, a release asset next to the data."""
     return f"rerank-{model.split('/')[-1]}.npz"
@@ -974,12 +979,26 @@ def _reranker(model: str, device: str) -> tuple:
         import torch  # loaded on the first rerank only
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        tok = AutoTokenizer.from_pretrained(model, padding_side="left")
-        lm = AutoModelForCausalLM.from_pretrained(model, dtype=torch.float32 if device == "cpu" else torch.bfloat16)
+        local = downloaded(model)
+        tok = AutoTokenizer.from_pretrained(model, padding_side="left", local_files_only=local)
+        lm = AutoModelForCausalLM.from_pretrained(model, dtype=torch.float32 if device == "cpu" else torch.bfloat16,
+                                                  local_files_only=local)
         _RERANKERS[model, device] = (tok, lm.to(device).eval(), tok.convert_tokens_to_ids("yes"), tok.convert_tokens_to_ids("no"),
                                      tok.encode(RERANK_PREFIX, add_special_tokens=False),
                                      tok.encode(RERANK_SUFFIX, add_special_tokens=False))
     return _RERANKERS[model, device]
+
+
+def downloaded(repo: str, revision: str | None = None) -> bool:
+    """Whether repo (at revision) is in the local Hugging Face cache; loading it then skips the Hub's network checks,
+    seconds per load."""
+    from huggingface_hub import snapshot_download
+
+    try:
+        snapshot_download(repo, revision=revision, local_files_only=True)
+        return True
+    except Exception:  # huggingface_hub raises several kinds for a missing snapshot
+        return False
 
 
 def rerank_text(ds: Dataset, i: int) -> str:
@@ -1052,8 +1071,9 @@ def rerank_local(ds: Dataset, question: str, rows, model: str = RERANK_MODEL, de
         if todo and device is None:
             lowest = min((known[d] for d in ids if d in known), default=0.0)
             if not rerank_misses[0]:
-                print(f"rerank_local: {len(todo)} of {len(ids)} pairs are not in the reranker cache and score lowest (no GPU "
-                      f"to score them); lab.rerank_misses[0] counts them from here on", file=sys.stderr)
+                warnings.warn(f"rerank_local: {len(todo)} of {len(ids)} pairs are not in the reranker cache and score "
+                              f"lowest (no GPU to score them); lab.rerank_misses[0] counts them from here on",
+                              RerankCacheMiss, stacklevel=2)
             rerank_misses[0] += len(todo)
             known.update(dict.fromkeys(todo, lowest))
         elif todo:
@@ -1332,7 +1352,8 @@ def embed(texts: list[str]) -> np.ndarray:
     with _ENCODER_LOCK:
         if not _ENCODER:
             full = SentenceTransformer(QUERY_MODEL, revision=QUERY_REVISION, trust_remote_code=True, device="cpu",
-                                       model_kwargs={"torch_dtype": torch.float32})
+                                       model_kwargs={"torch_dtype": torch.float32},
+                                       local_files_only=downloaded(QUERY_MODEL, QUERY_REVISION))
             model = SentenceTransformer(modules=[full[0], full[1]], device="cuda" if torch.cuda.is_available() else "cpu")
             model.max_seq_length = 512  # the transformer and the mean pooling, without the model's int8 step
             _ENCODER.append(model.eval())

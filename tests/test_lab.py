@@ -32,12 +32,13 @@ def test_rerank_local_reads_the_shipped_cache(no_gpu):
     assert lab.rerank_misses[0] == 0
 
 
-def test_without_a_gpu_a_miss_scores_lowest_of_the_call_and_warns_once(no_gpu, capsys):
-    assert lab.rerank_local(no_gpu, "q", [2, 0]).tolist() == [2.5, 2.5]
-    assert lab.rerank_local(no_gpu, "q", [0, 1, 2]).tolist() == [2.5, -1.0, -1.0]
-    assert lab.rerank_local(no_gpu, "unknown", [0, 1]).tolist() == [0.0, 0.0]
+def test_without_a_gpu_a_miss_scores_lowest_of_the_call_and_warns_once(no_gpu):
+    with pytest.warns(lab.RerankCacheMiss) as caught:
+        assert lab.rerank_local(no_gpu, "q", [2, 0]).tolist() == [2.5, 2.5]
+        assert lab.rerank_local(no_gpu, "q", [0, 1, 2]).tolist() == [2.5, -1.0, -1.0]
+        assert lab.rerank_local(no_gpu, "unknown", [0, 1]).tolist() == [0.0, 0.0]
     assert lab.rerank_misses[0] == 4
-    assert capsys.readouterr().err.count("rerank_local:") == 1
+    assert len(caught) == 1
 
 
 @pytest.fixture
