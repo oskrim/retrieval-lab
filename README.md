@@ -2,7 +2,8 @@
 
 `lab.ipynb` improves one ranking step by step on two datasets, measuring every step. `lab.py` holds the helpers, and
 the `lab` command evaluates and submits your own search or agent. Everything runs on a GPU with 48 GB or more: the
-question encoder, the reranker and the agent model (vLLM). Your lab page shows these commands with your URL and token.
+question encoder, the reranker and the agent model (vLLM); without a GPU, see [No GPU](#no-gpu). Your lab page shows
+these commands with your URL and token.
 
 Create a GPU instance with 48 GB or more (Ubuntu, Python 3.10 or newer), log in with SSH and run:
 
@@ -35,3 +36,21 @@ lab board agent
 ```
 
 `lab status` shows the GPU, the agent model, your connection and the downloads; `lab serve --stop` stops the model.
+
+## No GPU
+
+The lab also runs on a laptop, with less: the reranker's scores come from a precomputed cache (a pair outside it ranks
+lowest), and the agent runs through the lab's model instead of one on your machine. Install the CPU build of torch
+first; it skips about 3 GB of GPU libraries on Linux.
+
+```bash
+git clone https://github.com/oskrim/retrieval-lab && cd retrieval-lab
+python3 -m venv .venv && source .venv/bin/activate
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -e .
+lab setup                # the data, the question encoder and the reranker's scores
+lab connect URL TOKEN
+jupyter lab lab.ipynb
+```
+
+The notebook and every `lab` command above work, except `lab serve`.
