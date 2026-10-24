@@ -253,6 +253,109 @@ def tokenized(texts: list[str]) -> tuple[dict[str, int], np.ndarray, np.ndarray]
     return _tokenized[id(texts)][1:]
 
 
+CACHE_FORMAT = 1  # part of every DATA/cache key; bump it when what the cached arrays mean changes
+PERSIST_CHARS = 100_000  # texts at least this long keep their index in DATA/cache, so later processes skip the build
+_DIGESTS: dict[int, tuple[list[str], str]] = {}
+_POSTINGS: dict[tuple[int, int], tuple[list[str], Analyzer, dict[str, int], dict[str, np.ndarray]]] = {}
+_DF: dict[tuple[int, int, int], tuple[list[str], np.ndarray]] = {}
+
+
+def _digest(texts: list[str]) -> str:
+    """sha256 of the content of texts, once per list."""
+    if id(texts) not in _DIGESTS:
+        h = hashlib.sha256(len(texts).to_bytes(8, "little"))
+        for t in texts:
+            b = t.encode()
+            h.update(len(b).to_bytes(8, "little"))
+            h.update(b)
+        _DIGESTS[id(texts)] = (texts, h.hexdigest())  # holding texts keeps its id
+    return _DIGESTS[id(texts)][1]
+
+
+def _cache_name(kind: str, analyzer: Analyzer, texts: list[str], *more: list[str]) -> str | None:
+    """The DATA/cache entry of an index part of texts (and more) under analyzer, or None when it is not kept on disk:
+    short texts build in milliseconds, and a subclass of Analyzer may turn words into terms in its own way."""
+    if type(analyzer) is not Analyzer or sum(sum(map(len, t)) for t in (texts, *more)) < PERSIST_CHARS:
+        return None
+    from importlib.metadata import version
+
+    how = (CACHE_FORMAT, analyzer.stopwords and sorted(STOPWORDS), analyzer.stemming and version("snowballstemmer"),
+           _digest(texts), *map(_digest, more))
+    return f"{kind}-{hashlib.sha256(repr(how).encode()).hexdigest()[:24]}"
+
+
+def _disk_cached(name: str | None, build) -> dict[str, np.ndarray]:
+    """build()'s arrays: memory-mapped from DATA/cache/name when an earlier process saved them, else built and saved
+    there. A cache that cannot be read or written only costs the build."""
+    if name is None:
+        return build()
+    path = DATA / "cache" / name
+    if path.is_dir():
+        try:
+            return {f.stem: np.load(f, mmap_mode="r") for f in path.glob("*.npy")}
+        except (OSError, ValueError):
+            pass
+    arrays = build()
+    tmp = path.with_name(f"{name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.mkdir(parents=True)
+        for k, v in arrays.items():
+            np.save(tmp / f"{k}.npy", v)
+        tmp.rename(path)  # whole or not at all; a process that renamed first wins
+    except OSError:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return arrays
+
+
+def _postings(texts: list[str], analyzer: Analyzer) -> tuple[dict[str, int], dict[str, np.ndarray]]:
+    """The vocabulary and the positional arrays of Index(texts, analyzer); built once per process, and for long texts
+    once per machine."""
+    key = (id(texts), id(analyzer))
+    if key not in _POSTINGS:
+        arrays = _disk_cached(_cache_name("postings", analyzer, texts), lambda: _build_postings(texts, analyzer))
+        terms = bytes(arrays["terms"]).decode().split("\n") if len(arrays["terms"]) else []
+        _POSTINGS[key] = (texts, analyzer, dict(zip(terms, range(len(terms)))), arrays)  # holding them keeps their ids
+    return _POSTINGS[key][2:]
+
+
+def _build_postings(texts: list[str], analyzer: Analyzer) -> dict[str, np.ndarray]:
+    n = len(texts)
+    words, ids, start = tokenized(texts)
+    vocab: dict[str, int] = {}
+    to_term = np.array([-1 if w is None else vocab.setdefault(w, len(vocab))
+                        for w in map(analyzer.word, words)] or [-1], dtype=np.int64)  # word number -> term, -1 if dropped
+    doc = np.repeat(np.arange(n), np.diff(start))
+    pos = np.arange(len(ids)) - start[doc]
+    term = to_term[ids]
+    kept = term >= 0
+    term, doc, pos = term[kept], doc[kept], pos[kept]
+    order = np.argsort(term, kind="stable")  # occurrences come in document and position order already
+    posting = term[order] * n + doc[order]  # one per occurrence; equal neighbours are the same term in the same document
+    first = np.flatnonzero(np.r_[True, posting[1:] != posting[:-1]]) if len(posting) else np.zeros(0, dtype=np.int64)
+    return dict(terms=np.frombuffer("\n".join(vocab).encode(), dtype=np.uint8),  # terms are letters and digits
+                lengths=np.bincount(doc, minlength=n).astype(np.float64),
+                keys=doc[order] * STRIDE + pos[order],  # every occurrence: document * STRIDE + position
+                key_start=np.searchsorted(term[order], np.arange(len(vocab) + 1)),
+                doc=posting[first] % n, tf=np.diff(np.r_[first, len(posting)]).astype(np.float64),
+                start=np.searchsorted(posting[first] // n, np.arange(len(vocab) + 1)))
+
+
+def _idf_df(texts: list[str], analyzer: Analyzer, vocab: dict[str, int], idf_texts: list[str]) -> np.ndarray:
+    """Per term of Index(texts, analyzer), the number of idf_texts that contain it."""
+    key = (id(texts), id(analyzer), id(idf_texts))
+    if key not in _DF:
+        def build() -> dict[str, np.ndarray]:
+            other_words, other_ids, other_start = tokenized(idf_texts)
+            other_term = np.array([vocab.get(w, -1) if w is not None else -1 for w in map(analyzer.word, other_words)]
+                                  or [-1], dtype=np.int64)[other_ids]
+            other_doc = np.repeat(np.arange(len(idf_texts)), np.diff(other_start))
+            pairs = np.unique(other_term[other_term >= 0] * len(idf_texts) + other_doc[other_term >= 0])
+            return dict(df=np.bincount(pairs // len(idf_texts), minlength=len(vocab)))
+
+        _DF[key] = (texts, idf_texts, _disk_cached(_cache_name("df", analyzer, texts, idf_texts), build)["df"])
+    return _DF[key][2]
+
+
 class Index:
     """A positional inverted index of texts (one per document): for every term, the documents that contain it, how
     often (its postings), and at which positions. idf_texts: the texts whose document frequencies give idf (default:
@@ -260,31 +363,12 @@ class Index:
 
     def __init__(self, texts: list[str], analyzer: Analyzer = TOKENS, idf_texts: list[str] | None = None) -> None:
         self.analyzer, self.n = analyzer, len(texts)
-        words, ids, start = tokenized(texts)
-        self.vocab: dict[str, int] = {}
-        to_term = np.array([-1 if w is None else self.vocab.setdefault(w, len(self.vocab))
-                            for w in map(analyzer.word, words)] or [-1], dtype=np.int64)  # word number -> term, -1 if dropped
-        doc = np.repeat(np.arange(self.n), np.diff(start))
-        pos = np.arange(len(ids)) - start[doc]
-        term = to_term[ids]
-        kept = term >= 0
-        term, doc, pos = term[kept], doc[kept], pos[kept]
-        self.lengths = np.bincount(doc, minlength=self.n).astype(np.float64)
-        order = np.argsort(term, kind="stable")  # occurrences come in document and position order already
-        term, self.keys = term[order], doc[order] * STRIDE + pos[order]  # every occurrence: document * STRIDE + position
-        self.key_start = np.searchsorted(term, np.arange(len(self.vocab) + 1))
-        posting = term * self.n + doc[order]  # one per occurrence; equal neighbours are the same term in the same document
-        first = np.flatnonzero(np.r_[True, posting[1:] != posting[:-1]]) if len(posting) else np.zeros(0, dtype=np.int64)
-        self.doc, self.tf = posting[first] % self.n, np.diff(np.r_[first, len(posting)]).astype(np.float64)
-        self.start = np.searchsorted(posting[first] // self.n, np.arange(len(self.vocab) + 1))
+        self.vocab, a = _postings(texts, analyzer)
+        self.lengths, self.keys, self.key_start = a["lengths"], a["keys"], a["key_start"]
+        self.doc, self.tf, self.start = a["doc"], a["tf"], a["start"]
         df, n = np.diff(self.start), self.n
         if idf_texts is not None:  # document frequency over other texts, under the same analyzer
-            other_words, other_ids, other_start = tokenized(idf_texts)
-            other_term = np.array([self.vocab.get(w, -1) if w is not None else -1 for w in map(analyzer.word, other_words)]
-                                  or [-1], dtype=np.int64)[other_ids]
-            other_doc = np.repeat(np.arange(len(idf_texts)), np.diff(other_start))
-            pairs = np.unique(other_term[other_term >= 0] * len(idf_texts) + other_doc[other_term >= 0])
-            df, n = np.bincount(pairs // len(idf_texts), minlength=len(self.vocab)), len(idf_texts)
+            df, n = _idf_df(texts, analyzer, self.vocab, idf_texts), len(idf_texts)
         self.idf = np.log(1 + (n - df + 0.5) / (df + 0.5))
         self.avg = self.lengths.mean() if self.lengths.any() else 1.0
 

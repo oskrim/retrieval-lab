@@ -183,3 +183,37 @@ def test_crm_agent_shows_the_model_a_wrong_argument_type(fake_model):
                dict(role="assistant", content="DEALS: none")]
     assert lab.crm_agent("Deals in Germany?", [lab.ATTR_SEARCH], lab.ATTR)["deals"] == set()
     assert "AttributeError" in requests[1]["messages"][-1]["content"]
+
+
+def test_an_index_read_back_from_the_disk_cache_scores_as_a_fresh_build(tmp_path, monkeypatch):
+    monkeypatch.setattr(lab, "DATA", tmp_path)
+    monkeypatch.setattr(lab, "PERSIST_CHARS", 0)
+    texts = ["Encryption of data at rest", "Data is encrypted in transit and at rest", "Backups run nightly"]
+    analyzer = lab.Analyzer(stopwords=True, stemming=True)
+
+    def fresh(idf_texts):
+        for memo in ("_POSTINGS", "_DF", "_indexes"):  # a new process: nothing in memory
+            monkeypatch.setattr(lab, memo, {})
+        return lab.Index(texts, analyzer, idf_texts)
+
+    idf_texts = texts + ["encryption keys"]
+    built = fresh(idf_texts)
+    assert len(list((tmp_path / "cache").iterdir())) == 2  # the postings and the idf document frequencies
+    read = fresh(idf_texts)
+    assert isinstance(read.keys, np.memmap)
+    assert read.vocab == built.vocab
+    for q in ("encrypted data at rest", "nightly backups", "unknown words"):
+        assert read.bm25(q).tolist() == built.bm25(q).tolist()
+        assert read.phrase(q).tolist() == built.phrase(q).tolist()
+
+
+def test_an_analyzer_subclass_keeps_its_index_in_memory_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(lab, "DATA", tmp_path)
+    monkeypatch.setattr(lab, "PERSIST_CHARS", 0)
+
+    class Upper(lab.Analyzer):
+        def word(self, token):
+            return token.upper()
+
+    assert lab.Index(["a b", "b c"], Upper()).vocab == {"A": 0, "B": 1, "C": 2}
+    assert not (tmp_path / "cache").exists()
