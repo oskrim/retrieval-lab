@@ -31,8 +31,9 @@ echo "user $(id -un), HOME $HOME, ref $REF, steps $STEPS"
 missing=()
 command -v git > /dev/null || missing+=(git)
 python3 -c 'import ensurepip' 2> /dev/null || missing+=(python3-venv)
-# vLLM's Triton compiles a C helper against Python.h when the model server starts.
+# vLLM compiles kernels when the model server starts: Triton needs Python.h, FlashInfer needs ninja.
 [ -f "$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["include"])')/Python.h" ] || missing+=(python3-dev)
+command -v ninja > /dev/null || missing+=(ninja-build)
 if [ ${#missing[@]} -gt 0 ]; then
   sudo=
   [ "$(id -u)" = 0 ] || sudo=sudo
