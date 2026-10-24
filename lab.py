@@ -1,24 +1,23 @@
-"""Helpers for lab.ipynb: the data, BM25, score matrices, nDCG@10, plots, and the lab's reranking API.
-Plain Python and numpy.
-
-  python3 lab.py fetch                  downloads the data, with every precomputed vector, into ./data, and the
-                                        question encoder (embed) into the Hugging Face cache
-  python3 lab.py connect URL TOKEN      saves the lab URL and your token (both on your lab page) in .lab.json
+"""Helpers for lab.ipynb and the lab CLI (cli.py): the data, BM25, score matrices, nDCG@10, plots, the local reranker
+and agent model, and the lab's leaderboards. Set up with `lab setup`; `lab --help` lists the rest.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import operator
 import os
 import pathlib
 import re
-import sys
+import shutil
+import sqlite3
 import tarfile
 import threading
 import unicodedata
 import urllib.error
 import urllib.request
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from array import array
 from dataclasses import dataclass
@@ -28,9 +27,16 @@ import snowballstemmer
 
 HERE = pathlib.Path(__file__).resolve().parent
 DATA = HERE / "data"
-RELEASE = "https://github.com/oskrim/retrieval-lab/releases/download/data-v8"
+DATA_VERSION = "data-v8"
+RELEASE = f"https://github.com/oskrim/retrieval-lab/releases/download/{DATA_VERSION}"
 LATE_MODEL = "perplexity-ai/pplx-embed-v2-late-0.6b"
 QUERY_MODEL, QUERY_REVISION = "perplexity-ai/pplx-embed-v1-0.6b", "2c4d510dd4a732063c31a0f70193e35067b51fd8"
+RERANK_MODEL = "Qwen/Qwen3-Reranker-0.6B"  # in-process on your GPU (rerank_local)
+AGENT_MODEL = "Qwen/Qwen3.5-9B"  # served by vLLM on your GPU (lab serve, chat)
+VLLM_VERSION = "0.31.0"
+VLLM_ARGS = ("--max-model-len", "32768", "--gpu-memory-utilization", "0.6", "--enable-auto-tool-choice",
+             "--tool-call-parser", "hermes")
+VLLM_URL = "http://localhost:8000/v1"
 LAB = HERE / ".lab.json"
 
 
@@ -52,23 +58,52 @@ class Dataset:
             self.title_body = [f"{t} {x}" for t, x in zip(self.titles, self.bodies)]
         self.row = {d: i for i, d in enumerate(self.ids)}
         self.qids = list(self.queries)  # the row order of every score matrix
+        self.hidden_by_text: dict[str, set[str]] = {}  # a question's text -> what every question with that text hides
+        for q, t in self.queries.items():
+            self.hidden_by_text.setdefault(t, set()).update(self.hidden.get(q, ()))
         self.qrow = {q: i for i, q in enumerate(self.qids)}
         self.hidden_mask = np.zeros((len(self.qids), len(self.ids)), dtype=bool)
         for q, docs in self.hidden.items():
             self.hidden_mask[self.qrow[q], [self.row[d] for d in docs if d in self.row]] = True
 
 
-def fetch() -> pathlib.Path:
+def fetch(progress=None) -> pathlib.Path:
     """Downloads and unpacks the data once into ./data: the documents, questions and grades, and every vector the
-    notebook uses (dense, late-interaction tokens, the advanced sections' texts), about 1.3 GB."""
-    root = DATA / "data-v8"
-    if not root.exists():
-        DATA.mkdir(exist_ok=True)
-        urllib.request.urlretrieve(f"{RELEASE}/data-v8.tar.gz", DATA / "data-v8.tar.gz")
-        with tarfile.open(DATA / "data-v8.tar.gz") as t:
-            t.extractall(DATA, filter="data")
-        (DATA / "data-v8.tar.gz").unlink()
+    notebook uses (dense, late-interaction tokens, the advanced sections' texts), about 1.3 GB. An interrupted download
+    resumes; progress(done, total) gets the bytes so far."""
+    root = DATA / DATA_VERSION
+    if root.exists():
+        return root
+    DATA.mkdir(exist_ok=True)
+    part, unpacked = DATA / f"{DATA_VERSION}.tar.gz.part", DATA / f"{DATA_VERSION}.unpacking"
+    download(f"{RELEASE}/{DATA_VERSION}.tar.gz", part, progress)
+    shutil.rmtree(unpacked, ignore_errors=True)
+    with tarfile.open(part) as t:
+        t.extractall(unpacked, filter="data")
+    (unpacked / DATA_VERSION).rename(root)
+    unpacked.rmdir()
+    part.unlink()
     return root
+
+
+def download(url: str, path: pathlib.Path, progress=None) -> None:
+    """Downloads url to path, continuing from the bytes already in path."""
+    done = path.stat().st_size if path.exists() else 0
+    req = urllib.request.Request(url, headers={"Range": f"bytes={done}-"} if done else {})
+    try:
+        r = urllib.request.urlopen(req, timeout=60)
+    except urllib.error.HTTPError as e:
+        if e.code == 416:  # nothing left to send: path is complete
+            return
+        raise
+    with r, open(path, "ab" if r.status == 206 else "wb") as f:
+        done = done if r.status == 206 else 0
+        total = done + int(r.headers.get("Content-Length", 0))
+        while chunk := r.read(1 << 20):
+            f.write(chunk)
+            done += len(chunk)
+            if progress:
+                progress(done, total)
 
 
 def load(name: str, split: str = "test") -> Dataset:
@@ -409,7 +444,7 @@ class Tokens:
 
 def late_tokens(ds: Dataset, encode_on_gpu: bool = False) -> Tokens:
     """The token vectors of ds's documents and questions: the downloaded ones, or with encode_on_gpu your own, encoded
-    once on your GPU (needs requirements-gpu.txt) into late_tokens_gpu next to them, in the same form."""
+    once on your GPU into late_tokens_gpu next to them, in the same form."""
     path = fetch() / ds.name / ("late_tokens_gpu" if encode_on_gpu else "late_tokens")
     if not path.exists():
         encode_late_tokens(ds.name, path)
@@ -580,6 +615,30 @@ def cross_validate(ds: Dataset, X: np.ndarray, y: np.ndarray, fit, folds: int = 
 
 # ---- the lab's API
 
+class LabError(RuntimeError):
+    """A server refused a request: status is the HTTP code, detail its reason."""
+
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(f"{status}: {detail}")
+        self.status, self.detail = status, detail
+
+
+def post(url: str, body: dict | None, headers: dict[str, str], timeout: float = 120) -> dict:
+    """GET url (body None) or POST body as JSON; the JSON reply. LabError on an HTTP error, URLError when unreachable."""
+    req = urllib.request.Request(url, None if body is None else json.dumps(body).encode(),
+                                 {"Content-Type": "application/json", **headers})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        text = e.read().decode(errors="replace")
+        try:
+            detail = json.loads(text)["detail"]
+        except (ValueError, KeyError, TypeError):
+            detail = text
+        raise LabError(e.code, detail if isinstance(detail, str) else json.dumps(detail)) from None
+
+
 def connect(url: str, token: str) -> str:
     """Saves the lab URL and your token; returns your nickname."""
     LAB.write_text(json.dumps(dict(url=url.rstrip("/"), token=token)))
@@ -588,15 +647,20 @@ def connect(url: str, token: str) -> str:
 
 def call(path: str, body: dict | None = None) -> dict:
     if not LAB.exists():
-        raise RuntimeError("run the Connect command from your lab page first")
+        raise RuntimeError("connect first: lab connect URL TOKEN (both on your lab page)")
     lab = json.loads(LAB.read_text())
-    req = urllib.request.Request(lab["url"] + path, None if body is None else json.dumps(body).encode(),
-                                 {"Authorization": f"Bearer {lab['token']}", "Content-Type": "application/json"})
+    return post(lab["url"] + path, body, {"Authorization": f"Bearer {lab['token']}"})
+
+
+def chat(messages: list[dict], tools=(), tool_choice: str = "auto") -> dict:
+    """One reply of the agent model (AGENT_MODEL, served on your GPU by `lab serve`), in the OpenAI chat format."""
+    body = dict(model=AGENT_MODEL, messages=messages, **(dict(tools=list(tools), tool_choice=tool_choice) if tools else {}))
     try:
-        with urllib.request.urlopen(req, timeout=120) as r:
-            return json.load(r)
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"{e.code}: {e.read().decode(errors='replace')}") from None
+        return post(f"{VLLM_URL}/chat/completions", body, {}, timeout=600)
+    except LabError:
+        raise
+    except urllib.error.URLError:
+        raise RuntimeError("the agent model is not running; start it with: lab serve") from None
 
 
 def rerank(ds: Dataset, top: np.ndarray, model: str) -> np.ndarray:
@@ -610,6 +674,123 @@ def rerank(ds: Dataset, top: np.ndarray, model: str) -> np.ndarray:
     with ThreadPoolExecutor(8) as pool:
         list(pool.map(one, range(len(ds.qids))))
     return out
+
+
+# ---- one question at a time: the notebook's search as functions, and the local reranker
+
+SEARCH_ANALYZER = Analyzer(stopwords=True, stemming=True, synonyms=synonyms())
+SATURATION = 25  # BM25 / (SATURATION + BM25), per field
+_DENSE: dict[int, tuple[Dataset, np.ndarray, np.ndarray, dict[str, np.ndarray]]] = {}
+_BUILD_LOCK = threading.RLock()
+
+
+def dense_parts(ds: Dataset) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    """ds's mean document vector, its documents as centered sign bits (±1), and the downloaded vectors of its questions
+    by text; built once per ds. Datasets without downloaded vectors embed their documents ("<title>\n<body>")."""
+    with _BUILD_LOCK:
+        if id(ds) not in _DENSE:
+            if (fetch() / ds.name / "vectors.npz").exists():
+                docs, qv = vectors(ds)
+                known = {ds.queries[q]: v for q, v in zip(ds.qids, qv)}
+            else:
+                docs, known = embed_many([f"{t}\n{x}" for t, x in zip(ds.titles, ds.bodies)]), {}
+            mean = docs.mean(0)
+            _DENSE[id(ds)] = (ds, mean, np.where(docs - mean >= 0, 1, -1).astype(np.float32), known)
+        return _DENSE[id(ds)][1:]
+
+
+def hybrid(ds: Dataset, question: str, bm25_weight: float = 1.0, dense_weight: float = 4.0, n: int = 100,
+           mask: np.ndarray | None = None) -> np.ndarray:
+    """The rows of the n best documents for question, best first, as the notebook's search ranks them before reranking:
+    candidates are the top n by BM25 (body + title) and the top n by sign bits; each scores
+    bm25_weight · lexical + dense_weight · max(0, dense). lexical: saturated BM25 of body and title with stopwords,
+    stemming and synonyms, plus 0.2 · phrase matches; dense: the question's pplx vector against the documents' centered
+    sign bits. A question of ds keeps its hidden documents out; mask (one bool per document) searches only those."""
+    one = Dataset(ds.name, ds.ids, ds.titles, ds.bodies, {"q": question}, {"q": {}}, {"q": ds.hidden_by_text.get(question, set())},
+                  ds.title_body)
+    keep = np.ones(len(ds.ids), dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+    only = lambda s: np.where(keep, s, -np.inf)  # noqa: E731
+    body = bm25(one, ds.bodies, idf_texts=ds.title_body, analyzer=SEARCH_ANALYZER)
+    title = bm25(one, ds.titles, idf_texts=ds.title_body, analyzer=SEARCH_ANALYZER)
+    lexical = body / (SATURATION + body) + title / (SATURATION + title) + 0.2 * (
+        0.5 * phrase(one, ds.bodies, SEARCH_ANALYZER) + phrase(one, ds.titles, SEARCH_ANALYZER))
+    mean, bits, known = dense_parts(ds)
+    q = (known[question] if question in known else embed([question])[0]) - mean
+    n = min(n, len(ds.ids))
+    cand = candidates(one, [only(np.where(q >= 0, 1, -1).astype(np.float32) @ bits.T)[None], only(body + title)], n)
+    dense = np.maximum(0, q @ bits.T / np.sqrt(bits.shape[1]))[None]
+    fused = np.where(cand & keep, dense_weight * dense + bm25_weight * lexical, -np.inf)
+    rows = topk(one, fused, n)[0]
+    return rows[np.isfinite(fused[0, rows])]
+
+
+def argsort_desc(scores) -> np.ndarray:
+    """The positions of scores, highest first (ties keep their order)."""
+    return np.argsort(-np.asarray(scores, dtype=np.float64), kind="stable")
+
+
+RERANK_PREFIX = ("<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the "
+                 'Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>\n<|im_start|>user\n')
+RERANK_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+RERANK_INSTRUCTION = "Given a web search query, retrieve relevant passages that answer the query"
+RERANK_TOKENS, RERANK_BATCH = 512, 16
+_RERANKERS: dict[tuple[str, str], tuple] = {}
+_RERANK_DB: list[sqlite3.Connection] = []
+_RERANK_LOCK = threading.Lock()
+
+
+def _reranker(model: str, device: str) -> tuple:
+    if (model, device) not in _RERANKERS:
+        import torch  # loaded on the first rerank only
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(model, padding_side="left")
+        lm = AutoModelForCausalLM.from_pretrained(model, dtype=torch.float32 if device == "cpu" else torch.bfloat16)
+        _RERANKERS[model, device] = (tok, lm.to(device).eval(), tok.convert_tokens_to_ids("yes"), tok.convert_tokens_to_ids("no"),
+                                     tok.encode(RERANK_PREFIX, add_special_tokens=False),
+                                     tok.encode(RERANK_SUFFIX, add_special_tokens=False))
+    return _RERANKERS[model, device]
+
+
+def _rerank_db() -> sqlite3.Connection:
+    if not _RERANK_DB:
+        DATA.mkdir(exist_ok=True)
+        db = sqlite3.connect(DATA / "rerank.sqlite", check_same_thread=False)
+        db.execute("CREATE TABLE IF NOT EXISTS scores (model TEXT, question TEXT, doc TEXT, score REAL, "
+                   "PRIMARY KEY (model, question, doc))")
+        _RERANK_DB.append(db)
+    return _RERANK_DB[0]
+
+
+def rerank_local(ds: Dataset, question: str, rows, model: str = RERANK_MODEL, device: str = "cuda") -> np.ndarray:
+    """Qwen3-Reranker's log-odds that each document in rows (its title and body) answers question, in rows' order: the
+    logit of "yes" minus the logit of "no" (probability = 1 / (1 + e^-score), which rounds to 1 for many documents
+    where the log-odds still differ). The model loads once, on first use, and reads the first 512 tokens of each pair; every (model, question, document)
+    score is kept in data/rerank.sqlite, so a pair is scored once."""
+    ids = [ds.ids[i] for i in rows]
+    with _RERANK_LOCK:
+        db = _rerank_db()
+        known = dict(db.execute(f"SELECT doc, score FROM scores WHERE model = ? AND question = ? AND doc IN "
+                                f"({','.join('?' * len(ids))})", [model, question, *ids])) if ids else {}
+        todo = sorted({d for d in ids if d not in known}, key=lambda d: len(ds.bodies[ds.row[d]]))
+        if todo:
+            import torch
+
+            tok, lm, yes, no, prefix, suffix = _reranker(model, device)
+            for a in range(0, len(todo), RERANK_BATCH):
+                batch = todo[a:a + RERANK_BATCH]
+                docs = [f"{ds.titles[ds.row[d]]}\n{ds.bodies[ds.row[d]]}".strip() for d in batch]
+                texts = [f"<Instruct>: {RERANK_INSTRUCTION}\n<Query>: {question}\n<Document>: {x}" for x in docs]
+                enc = tok(texts, truncation=True, max_length=RERANK_TOKENS - len(prefix) - len(suffix), add_special_tokens=False)
+                padded = tok.pad({"input_ids": [prefix + x + suffix for x in enc["input_ids"]]}, padding=True,
+                                 return_tensors="pt").to(device)
+                with torch.inference_mode():
+                    logits = lm(**padded, logits_to_keep=1).logits[:, -1, :]
+                odds = (logits[:, yes].float() - logits[:, no].float()).cpu().tolist()
+                known.update(zip(batch, odds))
+                db.executemany("INSERT OR REPLACE INTO scores VALUES (?, ?, ?, ?)", [(model, question, d, s) for d, s in zip(batch, odds)])
+            db.commit()
+    return np.array([known[d] for d in ids], dtype=np.float32)
 
 
 def submit(ds: Dataset, search_with, label: str) -> dict:
@@ -1010,12 +1191,189 @@ def tool_catalog() -> list[dict]:
     return out
 
 
-if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "connect":
-        print(f"connected as {connect(sys.argv[2], sys.argv[3])}")
-    elif sys.argv[1:] == ["fetch"]:
-        print(f"data in {fetch()}")
-        from huggingface_hub import snapshot_download
-        print(f"question encoder in {snapshot_download(QUERY_MODEL, revision=QUERY_REVISION)}")
-    else:
-        sys.exit(__doc__)
+# ---- advanced: the CRM agent (the notebook's section on filters, sorting and counts), for agent.py and lab eval
+
+DEALS = crm()
+NUMBERS = ("amount_eur", "annual_revenue_eur", "employees", "probability")
+_VECS: dict[str, np.ndarray] = {}
+_CRM_INDEXES: dict[str, Dataset] = {}
+
+
+def embed_many(texts: list[str]) -> np.ndarray:
+    """Unit pplx vectors of texts: the precomputed ones (embeddings), the rest embedded once each."""
+    with _BUILD_LOCK:
+        if not _VECS:
+            _VECS.update(embeddings())
+        new = list(dict.fromkeys(t for t in texts if t not in _VECS))
+        _VECS.update(zip(new, embed(new)))
+        return np.stack([_VECS[t] for t in texts])
+
+
+def crm_index(name: str) -> Dataset:
+    """lab.documents(name) as a Dataset that hybrid can search (no questions); built once."""
+    with _BUILD_LOCK:
+        if name not in _CRM_INDEXES:
+            ids, titles, bodies = documents(name)
+            _CRM_INDEXES[name] = ds = Dataset(name, list(ids), list(titles), list(bodies), {}, {}, {})
+            dense_parts(ds)
+        return _CRM_INDEXES[name]
+
+
+def hits(ds: Dataset, rows) -> str:
+    return "\n".join(f"{n}. [doc:{ds.ids[i]}] {ds.titles[i]}\n   {ds.bodies[i][:300]}" for n, i in enumerate(rows, 1))
+
+
+def read(ds: Dataset, doc_id: str) -> str:
+    i = ds.row.get(doc_id)
+    return f"[doc:{doc_id}] {ds.titles[i]}\n{ds.bodies[i][:4000]}" if i is not None else f"no document {doc_id}"
+
+
+def _key(field: str, x):
+    return float(x) if field in NUMBERS else str(x).lower()  # dates are YYYY-MM-DD, so they compare as text
+
+
+def matches(deal: dict, field: str, want) -> bool:
+    """want: a value, a list of values (any of them), or {"min": x, "max": y}, both ends included; text ignores case."""
+    v = _key(field, deal[field])
+    if isinstance(want, dict):
+        return all(op(v, _key(field, want[end])) for end, op in (("min", operator.ge), ("max", operator.le)) if end in want)
+    return v in {_key(field, w) for w in (want if isinstance(want, list) else [want])}
+
+
+def search_crm(query: str = "", filters: dict | None = None, sort_by: str | None = None, descending: bool = True,
+               fields: list[str] | None = None, limit: int = 10, group_by: str | None = None) -> dict:
+    """Search on the deals, plus what their attributes allow: filters narrow the deals it searches, sort_by orders the
+    results by a number or date, fields picks what comes back, group_by counts the deals per value. total is the number
+    of deals that pass the filters; with a query, the results are the best matches among them."""
+    filters = filters or {}
+    unknown = [f for f in [*filters, sort_by, group_by, *(fields or [])] if f is not None and f not in DEALS[0]]
+    if unknown:
+        return dict(error=f"unknown fields {unknown}; the fields are {list(DEALS[0])}")
+    mask = np.array([all(matches(d, f, w) for f, w in filters.items()) for d in DEALS])
+    rows = list(hybrid(crm_index("crm"), query, n=20, mask=mask)) if query.strip() else list(np.flatnonzero(mask))
+    if sort_by:
+        rows.sort(key=lambda i: _key(sort_by, DEALS[i][sort_by]), reverse=descending)
+    keep = ["deal_id", *(fields or ["company", "industry", "country", "stage", "amount_eur", "owner"])]
+    out = dict(total=int(mask.sum()), deals=[{f: DEALS[i][f] for f in keep} for i in rows[:min(int(limit), 50)]])
+    if group_by:
+        out["counts"] = dict(Counter(DEALS[i][group_by] for i in np.flatnonzero(mask)).most_common())
+    return out
+
+
+def find_values(text: str, field: str | None = None, k: int = 10) -> list[dict]:
+    """The values of the category fields that best match text, e.g. "fintech" -> industry "Financial services"."""
+    ds = crm_index("crm-values")
+    mask = None if field is None else np.array([i.split("=", 1)[0] == field for i in ds.ids])
+    return [dict(zip(("field", "value"), ds.ids[i].split("=", 1))) for i in hybrid(ds, text, n=20, mask=mask)[:int(k)]]
+
+
+def find_fields(text: str, k: int = 3) -> list[dict]:
+    """The number and date fields that best match text, e.g. "biggest" -> amount_eur."""
+    ds = crm_index("crm-fields")
+    return [dict(field=ds.ids[i], about=ds.bodies[i]) for i in hybrid(ds, text, n=20)[:int(k)]]
+
+
+def plain_search(query: str) -> str:
+    """The 5 best deals for query, as a snippet each."""
+    ds = crm_index("crm")
+    return hits(ds, hybrid(ds, query, n=20)[:5])
+
+
+def read_deal(doc_id: str) -> str:
+    return read(crm_index("crm"), doc_id)
+
+
+CRM_SYSTEM = (f"You answer questions about our sales deals with the CRM search. Today is {CRM_TODAY}. A deal is open "
+              "until it is won or lost. End your answer with one line: DEALS: the comma-separated ids of the deals that answer "
+              "the question (DEALS: none if there are none).")
+
+
+def tool(name: str, description: str, required=(), **params) -> dict:
+    """An OpenAI function schema."""
+    return dict(type="function", function=dict(name=name, description=description,
+                                               parameters=dict(type="object", properties=params, required=list(required))))
+
+
+PLAIN_SEARCH = tool("search", "Search the CRM's deals. Returns the 5 best deals with a snippet each.", ["query"],
+                    query=dict(type="string"))
+READ_DEAL = tool("read", "Read one deal in full.", ["doc_id"], doc_id=dict(type="string"))
+ATTR_SEARCH = tool(
+    "search",
+    "Search the CRM's deals. Fields: deal_id, company, notes (text); industry, country, stage, owner, product, lead_source "
+    "(categories); amount_eur, annual_revenue_eur, employees, probability (numbers); close_date, last_activity_date "
+    "(dates, YYYY-MM-DD). Returns the number of deals passing the filters and the first `limit` of them.",
+    query=dict(type="string", description="What to look for in the deals; empty: every deal that passes the filters."),
+    filters=dict(type="object", description='{field: value | [values] | {"min": x, "max": y}}; exact values, any case; '
+                                            "min and max are inclusive."),
+    sort_by=dict(type="string", description="A number or date field."), descending=dict(type="boolean"),
+    fields=dict(type="array", items=dict(type="string"), description="The fields to return."),
+    limit=dict(type="integer", description="At most 50; default 10."),
+    group_by=dict(type="string", description="A category field: also return the number of matching deals per value."))
+FIND_VALUES = tool("find_values", "Find the exact values of the category fields (industry, country, stage, owner, product, "
+                   "lead_source) that match a word or phrase.", ["text"], text=dict(type="string"),
+                   field=dict(type="string", description="Only this field's values."), k=dict(type="integer"))
+FIND_FIELDS = tool("find_fields", "Find the number and date fields that match a property, e.g. 'size of the deal'.", ["text"],
+                   text=dict(type="string"), k=dict(type="integer"))
+PLAIN = dict(search=plain_search, read=read_deal)  # tool name -> the function that runs it
+ATTR = dict(search=search_crm, find_values=find_values, find_fields=find_fields)
+
+
+def crm_agent(question: str, tools: list[dict], functions: dict, system: str = CRM_SYSTEM, budget: int = 5,
+              verbose: bool = False) -> dict:
+    """The model answers with up to `budget` turns of tool calls, then one turn with tools off. It lists its deals in
+    the last line, so it is judged on what it says it found."""
+    messages = [dict(role="system", content=system), dict(role="user", content=question)]
+    calls = []
+    for turn in range(budget + 1):
+        if turn == budget:
+            messages.append(dict(role="user", content="Tools are off now. Write your final answer from what you have found."))
+        msg = chat(messages, tools, "auto" if turn < budget else "none")["choices"][0]["message"]
+        messages.append(msg)
+        for call_ in msg.get("tool_calls") or []:
+            name = call_["function"]["name"]
+            try:
+                args = json.loads(call_["function"]["arguments"])
+                out = functions[name](**args)
+            except (KeyError, TypeError, ValueError, RuntimeError) as e:  # the model sees the error and can retry
+                out = dict(error=f"{type(e).__name__}: {e}")
+            calls.append(name)
+            if verbose:
+                print(f"{name}({call_['function']['arguments']})\n  -> {str(out)[:400]}")
+            messages.append(dict(role="tool", tool_call_id=call_["id"],
+                                 content=out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)))
+        if not msg.get("tool_calls"):
+            break
+    answer = msg["content"] or ""
+    last = re.findall(r"^\W*DEALS:(.*)$", answer, re.M)
+    return dict(answer=answer, deals=set(re.findall(r"D\d{4}", last[-1])) if last else set(), calls=calls)
+
+
+NORDICS = ["Norway", "Sweden", "Denmark", "Finland", "Iceland"]
+OPEN = [s for s in STAGES if not s.startswith("Closed")]
+CRM_QUESTIONS = [  # (question, the search_crm call that answers it)
+    ("Fintech deals in the Nordics that are in negotiation or have a contract out.",
+     dict(filters=dict(industry="Financial services", country=NORDICS, stage=["Negotiation", "Contract sent"]))),
+    ("Which 5 of Maria's open deals have gone quiet the longest?",
+     dict(filters=dict(owner="Maria Virtanen", stage=OPEN), sort_by="last_activity_date", descending=False, limit=5)),
+    ("Which deals did we lose in Germany this year?",
+     dict(filters=dict(country="Germany", stage="Closed lost", close_date=dict(min="2026-01-01")))),
+    ("Pharma companies with more than 2,000 staff that are still in our pipeline.",
+     dict(filters=dict(industry="Pharmaceuticals", employees=dict(min=2001), stage=OPEN))),
+    ("The five largest deals for our AI product in the DACH countries.",
+     dict(filters=dict(product="AI Assistant", country=["Germany", "Austria", "Switzerland"]), sort_by="amount_eur", limit=5)),
+    ("Jonas's deals over 30k that haven't got past qualification yet.",
+     dict(filters=dict(owner="Jonas Berg", amount_eur=dict(min=30000), stage=["Prospecting", "Qualification"]))),
+    ("Which of Anna's deals close in the first quarter of 2027?",
+     dict(filters=dict(owner="Anna Schmidt", close_date=dict(min="2027-01-01", max="2027-03-31")))),
+    ("Open energy deals where nobody has talked to the customer since the start of September.",
+     dict(filters=dict(industry="Energy", stage=OPEN, last_activity_date=dict(max="2026-08-31")))),
+    ("Which banks and insurers in France have we had deals with?",
+     dict(filters=dict(industry=["Financial services", "Insurance"], country="France"))),
+    ("Small companies (under 50 people) we won in the Benelux.",
+     dict(filters=dict(employees=dict(max=49), stage="Closed won", country=["Netherlands", "Belgium", "Luxembourg"]))),
+]
+
+
+def crm_dev() -> list[tuple[str, set[str]]]:
+    """The dev CRM questions and the set of deal ids that answers each."""
+    return [(q, {d["deal_id"] for d in search_crm(**{"limit": 50, **call_})["deals"]}) for q, call_ in CRM_QUESTIONS]
