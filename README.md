@@ -1,33 +1,37 @@
 # Retrieval lab
 
-`lab.ipynb` improves one ranking step by step on two datasets, measuring every step. `lab.py` holds the helpers.
-Python 3.10 or newer (on Ubuntu: `sudo apt install python3-venv`). Your lab page shows these with your URL and token.
+`lab.ipynb` improves one ranking step by step on two datasets, measuring every step. `lab.py` holds the helpers, and
+the `lab` command evaluates and submits your own search or agent. Everything runs on a GPU with 48 GB or more: the
+question encoder, the reranker and the agent model (vLLM). Your lab page shows these commands with your URL and token.
 
-Without a GPU (laptop): downloads the data with every precomputed vector (about 1.3 GB) and the question encoder
-(1.2 GB); do it before the workshop if you can. The first pip line installs the CPU build of torch, which skips
-about 3 GB of GPU libraries on Linux.
-
-```bash
-git clone https://github.com/oskrim/retrieval-lab && cd retrieval-lab
-python3 -m venv .venv
-.venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
-.venv/bin/pip install -r requirements.txt
-.venv/bin/python lab.py fetch
-.venv/bin/python lab.py connect URL TOKEN
-.venv/bin/jupyter lab lab.ipynb
-```
-
-With a GPU: the same download; set `ENCODE_ON_GPU = True` in the notebook's first cell and it encodes the
-late-interaction token vectors again itself (about 10 minutes on an RTX 3090).
+Create a GPU instance with 48 GB or more (Ubuntu, Python 3.10 or newer), log in with SSH and run:
 
 ```bash
 git clone https://github.com/oskrim/retrieval-lab && cd retrieval-lab
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt -r requirements-gpu.txt
-.venv/bin/python lab.py fetch
-.venv/bin/python lab.py connect URL TOKEN
-.venv/bin/jupyter lab lab.ipynb
+python3 -m venv .venv && source .venv/bin/activate   # on Ubuntu, python3-venv first if this fails
+pip install -e .
+lab setup                # checks the GPU; downloads the data and models; installs vLLM; safe to re-run
+lab connect URL TOKEN
+lab serve                # starts the agent model in the background
+jupyter lab --no-browser lab.ipynb
 ```
 
-On a remote machine, start Jupyter with `.venv/bin/jupyter lab --no-browser lab.ipynb`,
-then run `ssh -L 8888:localhost:8888 USER@MACHINE` on your laptop and open the `http://localhost:8888/...` link it printed.
+To open the notebook, run `ssh -L 8888:localhost:8888 USER@MACHINE` on your laptop and open the
+`http://localhost:8888/...` link Jupyter printed.
+
+Then, in a second SSH session (`source .venv/bin/activate` first):
+
+```bash
+lab new search                          # a working search.py: hybrid candidates, then the reranker
+lab eval search.py                      # nDCG@10 on the dev questions, next to your best so far
+lab eval search.py --worst 5            # ... and the 5 worst questions with your top 10
+lab submit search.py -m "what changed"  # the leaderboard's questions; prints your score and rank
+lab board --watch
+
+lab new agent                           # a working agent.py for the CRM questions
+lab eval agent.py
+lab submit agent.py -m "what changed"
+lab board agent
+```
+
+`lab status` shows the GPU, the agent model, your connection and the downloads; `lab serve --stop` stops the model.
