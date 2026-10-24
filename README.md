@@ -1,11 +1,11 @@
 # Retrieval lab
 
 `lab.ipynb` improves one ranking step by step on two datasets, measuring every step. `lab.py` holds the helpers, and
-the `lab` command evaluates and submits your own search or agent. Everything runs on a GPU with 48 GB or more: the
+the `lab` command evaluates and submits your own search or agent. Everything runs on a GPU with 80 GB or more (on Verda: A100 80GB or RTX PRO 6000 96GB): the
 question encoder, the reranker and the agent model (vLLM); without a GPU, see [No GPU](#no-gpu). Your lab page shows
 these commands with your URL and token.
 
-Create a GPU instance with 48 GB or more (Ubuntu, Python 3.10 or newer), log in with SSH and run:
+Create a GPU instance with 80 GB or more (Ubuntu, Python 3.10 or newer), log in with SSH and run:
 
 ```bash
 git clone https://github.com/oskrim/retrieval-lab && cd retrieval-lab

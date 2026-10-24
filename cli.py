@@ -35,7 +35,7 @@ HOME = pathlib.Path(os.environ.get("LAB_HOME", "~/.lab")).expanduser()
 VENV = HOME / "vllm-venv"
 SERVE_LOG, SERVE_PID, EVALS = HOME / "serve.log", HOME / "serve.pid", HOME / "evals.jsonl"
 TEMPLATES = lab.HERE / "templates"
-MIN_FREE_GB = 40
+MIN_FREE_GB = 60
 LABEL_CHARS = 60  # the lab's limit on a submission's label
 EVAL_SETS = (("fiqa", "dev"), ("caiq", "test"))  # caiq has no dev split
 BOARD_DATASET = "fiqa"
@@ -447,7 +447,7 @@ def cmd_setup(args) -> None:
         name, free, total = found
         if free < MIN_FREE_GB * 1e9 and not args.force:
             raise Fail(f"{name} has {gb(free)} free of {gb(total)}; the lab needs {MIN_FREE_GB} GB free "
-                       f"(a 48 GB GPU). Run on a larger GPU, or pass --force to try anyway")
+                       f"(an 80 GB GPU such as an A100 80GB or RTX PRO 6000). Run on a larger GPU, or pass --force to try anyway")
         ok(f"GPU  {name} · {gb(free)} free of {gb(total)}")
 
     download("data", lab.DATA / lab.DATA_VERSION, lab.fetch)
@@ -510,6 +510,23 @@ def tail(path: pathlib.Path, n: int = 15) -> str:
     return "\n".join(path.read_text(errors="replace").splitlines()[-n:]) if path.exists() else ""
 
 
+def vllm_args() -> list[str]:
+    """lab.VLLM_ARGS with the model's download path filled in, and a GPU memory share that leaves
+    lab.VLLM_LEAVE_GB free for the reranker and the encoder."""
+    import torch
+    from huggingface_hub import snapshot_download
+
+    try:
+        snapshot = snapshot_download(lab.AGENT_MODEL, local_files_only=True)
+    except Exception:  # not downloaded (huggingface_hub raises several types for this)
+        raise Fail(f"{lab.AGENT_MODEL} is not downloaded; run lab setup first") from None
+    total = torch.cuda.mem_get_info(0)[1]
+    if total < MIN_FREE_GB * 1e9:
+        raise Fail(f"the GPU has {gb(total)}; {lab.AGENT_MODEL} and the reranker need a card of {MIN_FREE_GB} GB or more")
+    share = round(1 - lab.VLLM_LEAVE_GB * 1e9 / total, 2)
+    return [a.replace("{snapshot}", snapshot) for a in lab.VLLM_ARGS] + ["--gpu-memory-utilization", str(share)]
+
+
 def cmd_serve(args) -> None:
     if args.stop:
         stop_vllm()
@@ -529,7 +546,7 @@ def cmd_serve(args) -> None:
         with open(SERVE_LOG, "w") as log:
             proc = subprocess.Popen([str(binary), "serve", lab.AGENT_MODEL, "--host", "127.0.0.1",
                                      "--port", str(urllib.parse.urlsplit(lab.VLLM_URL).port),
-                                     *lab.VLLM_ARGS], stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                     *vllm_args()], stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                     start_new_session=True)
         SERVE_PID.write_text(str(proc.pid))
     start, timeout = time.time(), args.timeout

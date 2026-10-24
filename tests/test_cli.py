@@ -145,6 +145,7 @@ def test_serve_shows_the_log_when_vllm_exits_while_starting(tmp_path, capsys, mo
                         ("SERVE_PID", tmp_path / "serve.pid")):
         monkeypatch.setattr(cli, name, value)
     monkeypatch.setattr(cli.lab, "local_agent_model", lambda: None)
+    monkeypatch.setattr(cli, "vllm_args", lambda: ["--gpu-memory-utilization", "0.8"])
     (tmp_path / "venv" / "bin").mkdir(parents=True)
     vllm = tmp_path / "venv" / "bin" / "vllm"
     vllm.write_text("#!/bin/sh\necho 'CUDA error: no kernel image'\nexit 1\n")
@@ -184,3 +185,17 @@ def test_model_errors_are_not_blamed_on_the_participant(tmp_path, capsys, monkey
     assert cli.main(["eval", str(path)]) == 1
     out = capsys.readouterr().out
     assert "answered 500: CUDA out of memory" in out and "raised" not in out
+
+
+def test_vllm_args_fill_the_snapshot_and_leave_memory_for_the_reranker(monkeypatch):
+    import huggingface_hub
+    import torch
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo, local_files_only: "/models/nemo")
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda i: (80e9, 80e9))
+    args = cli.vllm_args()
+    assert "/models/nemo/nano_v3_reasoning_parser.py" in args and not any("{snapshot}" in a for a in args)
+    assert args[-2:] == ["--gpu-memory-utilization", str(round(1 - cli.lab.VLLM_LEAVE_GB * 1e9 / 80e9, 2))]
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda i: (24e9, 24e9))
+    with pytest.raises(cli.Fail):
+        cli.vllm_args()

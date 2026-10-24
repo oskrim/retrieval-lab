@@ -36,12 +36,16 @@ RELEASE = f"https://github.com/oskrim/retrieval-lab/releases/download/{DATA_VERS
 LATE_MODEL = "perplexity-ai/pplx-embed-v2-late-0.6b"
 QUERY_MODEL, QUERY_REVISION = "perplexity-ai/pplx-embed-v1-0.6b", "2c4d510dd4a732063c31a0f70193e35067b51fd8"
 RERANK_MODEL = "Qwen/Qwen3-Reranker-4B"  # in-process on your GPU (rerank_local)
-AGENT_MODEL = "Qwen/Qwen3.5-9B"  # served by vLLM on your GPU (lab serve, chat)
+AGENT_MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"  # served by vLLM on your GPU (lab serve, chat)
 VLLM_VERSION = "0.31.0"
-VLLM_ARGS = ("--max-model-len", "32768", "--gpu-memory-utilization", "0.6", "--enable-auto-tool-choice",
-             "--tool-call-parser", "qwen3_coder", "--reasoning-parser", "qwen3")
+VLLM_ARGS = ("--max-model-len", "32768", "--max-num-seqs", "16", "--enable-auto-tool-choice", "--trust-remote-code",
+             "--tool-call-parser", "qwen3_coder", "--reasoning-parser-plugin", "{snapshot}/nano_v3_reasoning_parser.py",
+             "--reasoning-parser", "nano_v3", "--reasoning-config",
+             '{"reasoning_start_str": "<think>", "reasoning_end_str": "</think>"}')  # {snapshot}: the model's download
+VLLM_LEAVE_GB = 16  # GPU memory lab serve leaves free for the reranker and the question encoder
 VLLM_URL = "http://localhost:8000/v1"
-AGENT_REQUEST: dict = {}  # extra request fields for the local agent model, e.g. its thinking switch
+AGENT_REQUEST: dict = {"thinking_token_budget": 1024}  # request fields for the local agent model: it thinks at most
+# 1024 tokens before each reply; {"chat_template_kwargs": {"enable_thinking": False}} turns thinking off
 LAB_AGENT_MODEL = "deepseek-v4-flash"  # the lab server's agent model, for machines without a GPU
 LAB = HERE / ".lab.json"
 
