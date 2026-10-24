@@ -151,6 +151,8 @@ def checked_search(module, path: pathlib.Path):
     def run(ds: lab.Dataset, question: str, k: int = 10) -> list[int]:
         try:
             rows = module.search(ds, question, k=k)
+        except lab.LabError:
+            raise
         except Exception as e:
             raise UserCodeError(e, path) from None
         try:
@@ -164,6 +166,8 @@ def checked_answer(module, path: pathlib.Path):
     def run(question: str) -> set[str]:
         try:
             found = module.answer(question)
+        except lab.LabError:
+            raise
         except Exception as e:
             raise UserCodeError(e, path) from None
         try:
@@ -228,6 +232,9 @@ def eval_search(path: pathlib.Path, module, worst: int) -> None:
         table.add_row(label, str(len(x)), f"[num]{x.mean():.3f}[/]", f"{lo:.3f} – {hi:.3f}", before_cell(before))
         remember(path, "search", label, float(x.mean()), lo, hi, len(x))
     console.print(table)
+    if lab.rerank_misses[0]:
+        console.print(f"[warn]![/] {lab.rerank_misses[0]:,} reranker pairs were in no cache and ranked lowest (no GPU to "
+                      "score them); the scores above are lower than on a GPU")
     if worst:
         show_worst_search(sets, scores, ranked, worst)
 
@@ -256,7 +263,7 @@ def doc_line(ds: lab.Dataset, prefix: str, i: int, grade: int) -> None:
 
 
 def eval_agent(path: pathlib.Path, module, worst: int) -> None:
-    require_vllm()
+    require_agent()
     answer = checked_answer(module, path)
     questions = lab.crm_dev()
     found: dict[int, set[str]] = {}
@@ -306,7 +313,7 @@ def cmd_submit(args) -> None:
             bar.update(task, description="running on the board's questions")
             result = lab.submit(ds, lambda ds_, question, k=10: counted(bar, task, search(ds_, question, k)), args.m)
         else:
-            require_vllm()
+            require_agent()
             answer = checked_answer(module, path)
             answer(lab.CRM_QUESTIONS[0][0])
             bar.update(task, description="running on the board's questions")
@@ -399,34 +406,40 @@ def install_vllm() -> None:
                 raise Fail(f"installing vLLM failed; see {log}")
 
 
+LAPTOP = "laptop mode: no GPU; reranker from the precomputed cache, agent through the lab server"
+
+
 def cmd_setup(args) -> None:
     with console.status("checking the GPU"):
         found = gpu()
     if found is None:
-        raise Fail("no GPU found (torch.cuda.is_available() is False); the lab runs its models on a GPU")
-    name, free, total = found
-    if free < MIN_FREE_GB * 1e9 and not args.force:
-        raise Fail(f"{name} has {gb(free)} free of {gb(total)}; the lab needs {MIN_FREE_GB} GB free "
-                   f"(a 48 GB GPU). Run on a larger GPU, or pass --force to try anyway")
-    ok(f"GPU  {name} · {gb(free)} free of {gb(total)}")
-
-    if (lab.DATA / lab.DATA_VERSION).exists():
-        ok(f"data  {lab.DATA_VERSION}")
+        console.print(f"[warn]![/] {LAPTOP}")
     else:
-        with Progress(TextColumn("  data"), BarColumn(complete_style="acc"), DownloadColumn(), TransferSpeedColumn(),
-                      console=console, transient=True) as bar:
-            task = bar.add_task("data", total=None)
-            lab.fetch(lambda done, total: bar.update(task, completed=done, total=total or None))
-        ok(f"data  {lab.DATA_VERSION}")
+        name, free, total = found
+        if free < MIN_FREE_GB * 1e9 and not args.force:
+            raise Fail(f"{name} has {gb(free)} free of {gb(total)}; the lab needs {MIN_FREE_GB} GB free "
+                       f"(a 48 GB GPU). Run on a larger GPU, or pass --force to try anyway")
+        ok(f"GPU  {name} · {gb(free)} free of {gb(total)}")
+
+    download("data", lab.DATA / lab.DATA_VERSION, lab.fetch)
+    cache = download("reranker scores", lab.DATA / lab.DATA_VERSION / lab.rerank_cache_name(), lab.fetch_rerank_cache)
+    if cache is None:
+        console.print(f"[warn]![/] the release has no {lab.rerank_cache_name()} yet; "
+                      + ("the reranker scores on the GPU" if found else "unscored pairs rank lowest"))
 
     from huggingface_hub import snapshot_download
 
-    for what, repo, rev in (("encoder", lab.QUERY_MODEL, lab.QUERY_REVISION), ("reranker", lab.RERANK_MODEL, None),
-                            ("agent model", lab.AGENT_MODEL, None)):
+    models = [("encoder", lab.QUERY_MODEL, lab.QUERY_REVISION)]
+    if found:
+        models += [("reranker", lab.RERANK_MODEL, None), ("agent model", lab.AGENT_MODEL, None)]
+    for what, repo, rev in models:
         console.print(f"[acc]→[/] {what}  {repo}")
         snapshot_download(repo, revision=rev)
         ok(f"{what}  {repo}")
 
+    if found is None:
+        console.print("\n[dim]next:[/] lab connect URL TOKEN [dim](both on your lab page)[/]")
+        return
     if vllm_installed():
         ok(f"vLLM {lab.VLLM_VERSION}")
     else:
@@ -435,21 +448,24 @@ def cmd_setup(args) -> None:
     console.print("\n[dim]next:[/] lab connect URL TOKEN [dim](both on your lab page), then[/] lab serve")
 
 
-def vllm_model() -> str | None:
-    """The model vLLM serves on localhost, or None when it does not answer."""
+def download(what: str, path: pathlib.Path, fetch) -> pathlib.Path | None:
+    """fetch(progress) with a progress bar, unless path is there already."""
+    if not path.exists():
+        with Progress(TextColumn(f"  {what}"), BarColumn(complete_style="acc"), DownloadColumn(), TransferSpeedColumn(),
+                      console=console, transient=True) as bar:
+            task = bar.add_task(what, total=None)
+            if fetch(progress=lambda done, total: bar.update(task, completed=done, total=total or None)) is None:
+                return None
+    ok(f"{what}  {path.name}")
+    return path
+
+
+def require_agent() -> None:
+    """Fails unless chat has a model: the local vLLM, or the lab server."""
     try:
-        with urllib.request.urlopen(f"{lab.VLLM_URL}/models", timeout=2) as r:
-            return json.load(r)["data"][0]["id"]
-    except (OSError, ValueError, KeyError, IndexError):
-        return None
-
-
-def require_vllm() -> None:
-    model = vllm_model()
-    if model is None:
-        raise Fail("the agent model is not running; start it with: lab serve")
-    if model != lab.AGENT_MODEL:
-        raise Fail(f"{lab.VLLM_URL} serves {model}, not {lab.AGENT_MODEL}; stop that server, then run lab serve")
+        lab.agent_endpoint()
+    except RuntimeError as e:
+        raise Fail(str(e)) from None
 
 
 def serve_pid() -> int | None:
@@ -469,14 +485,16 @@ def cmd_serve(args) -> None:
     if args.stop:
         stop_vllm()
         return
-    if (model := vllm_model()) is not None:
-        require_vllm()
+    if (model := lab.local_agent_model()) is not None:
+        if model != lab.AGENT_MODEL:
+            raise Fail(f"{lab.VLLM_URL} serves {model}, not {lab.AGENT_MODEL}; stop that server, then run lab serve")
         ok(f"vLLM is already up · {model}")
         return
     if serve_pid() is None:
         binary = VENV / "bin" / "vllm"
         if not binary.exists():
-            raise Fail("vLLM is not installed; run lab setup first")
+            raise Fail("vLLM is not installed; run lab setup first (on a GPU machine; without one, chat goes "
+                       "through the lab server and there is nothing to serve)")
         HOME.mkdir(parents=True, exist_ok=True)
         with open(SERVE_LOG, "w") as log:
             proc = subprocess.Popen([str(binary), "serve", lab.AGENT_MODEL, "--host", "127.0.0.1",
@@ -487,7 +505,7 @@ def cmd_serve(args) -> None:
     start, timeout = time.time(), args.timeout
     try:
         with console.status("") as status:
-            while vllm_model() is None:
+            while lab.local_agent_model() is None:
                 if serve_pid() is None:
                     SERVE_PID.unlink(missing_ok=True)
                     console.print(Panel(Text(tail(SERVE_LOG), style="dim"), title="serve.log", title_align="left",
@@ -534,24 +552,29 @@ def cmd_status(args) -> None:
 
     with console.status("checking"):
         found = gpu()
-        model = vllm_model()
+        model = lab.local_agent_model()
         try:
             nick = lab.call("/api/me")["nick"] if lab.LAB.exists() else None
             conn = f"[ok]connected[/] as [num]{nick}[/] · {json.loads(lab.LAB.read_text())['url']}" if nick else \
                 "[warn]not connected[/] · lab connect URL TOKEN"
         except (lab.LabError, OSError) as e:
             conn = f"[err]refused[/] · {e}"
-        models = " · ".join(f"{what} {'[ok]✓[/]' if cached(repo, rev) else '[err]✗[/]'}" for what, repo, rev in
-                            (("encoder", lab.QUERY_MODEL, lab.QUERY_REVISION), ("reranker", lab.RERANK_MODEL, None),
-                             ("agent", lab.AGENT_MODEL, None)))
+        needed = [("encoder", lab.QUERY_MODEL, lab.QUERY_REVISION)] + (
+            [("reranker", lab.RERANK_MODEL, None), ("agent", lab.AGENT_MODEL, None)] if found else [])
+        models = " · ".join(f"{what} {'[ok]✓[/]' if cached(repo, rev) else '[err]✗[/]'}" for what, repo, rev in needed)
+        scores = (lab.DATA / lab.DATA_VERSION / lab.rerank_cache_name()).exists()
     grid = Table.grid(padding=(0, 2))
     grid.add_column(style="dim")
     grid.add_column()
-    grid.add_row("GPU", f"{found[0]} · {gb(found[1])} free of {gb(found[2])}" if found else "[err]none[/]")
-    grid.add_row("vLLM", f"[ok]up[/] · {model}" if model else "[warn]down[/] · lab serve")
+    grid.add_row("mode", "GPU" if found else f"[warn]{LAPTOP.removeprefix('laptop mode: ')}[/]")
+    grid.add_row("GPU", f"{found[0]} · {gb(found[1])} free of {gb(found[2])}" if found else "[warn]none[/]")
+    grid.add_row("agent", f"[ok]{model}[/] on this machine" if model == lab.AGENT_MODEL else
+                 f"{lab.LAB_AGENT_MODEL} through the lab · lab serve runs {lab.AGENT_MODEL} here" if found else
+                 f"{lab.LAB_AGENT_MODEL} through the lab")
     grid.add_row("lab", conn)
     grid.add_row("data", f"{lab.DATA_VERSION} [ok]✓[/]" if (lab.DATA / lab.DATA_VERSION).exists() else "[err]missing[/] · lab setup")
     grid.add_row("models", models)
+    grid.add_row("reranker scores", f"{lab.rerank_cache_name()} " + ("[ok]✓[/]" if scores else "[err]✗[/] · lab setup"))
     console.print(Panel(grid, title="lab status", title_align="left", border_style="acc", expand=False))
 
 

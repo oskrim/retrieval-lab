@@ -79,7 +79,7 @@ def test_syntax_errors_point_at_the_line(tmp_path):
 
 def test_main_exits_nonzero_without_a_cli_traceback(tmp_path, capsys, monkeypatch):
     path = write(tmp_path, "boom.py", "def answer(question):\n    raise ValueError('boom')\n")
-    monkeypatch.setattr(cli, "require_vllm", lambda: None)
+    monkeypatch.setattr(cli, "require_agent", lambda: None)
     monkeypatch.setattr(cli, "HOME", tmp_path)
     assert cli.main(["eval", str(path)]) == 1
     out = capsys.readouterr().out

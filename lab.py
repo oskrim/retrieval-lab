@@ -4,6 +4,7 @@ and agent model, and the lab's leaderboards. Set up with `lab setup`; `lab --hel
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import operator
@@ -12,6 +13,7 @@ import pathlib
 import re
 import shutil
 import sqlite3
+import sys
 import tarfile
 import threading
 import unicodedata
@@ -37,6 +39,7 @@ VLLM_VERSION = "0.31.0"
 VLLM_ARGS = ("--max-model-len", "32768", "--gpu-memory-utilization", "0.6", "--enable-auto-tool-choice",
              "--tool-call-parser", "hermes")
 VLLM_URL = "http://localhost:8000/v1"
+LAB_AGENT_MODEL = "deepseek-v4-flash"  # the lab server's agent model, for machines without a GPU
 LAB = HERE / ".lab.json"
 
 
@@ -652,15 +655,41 @@ def call(path: str, body: dict | None = None) -> dict:
     return post(lab["url"] + path, body, {"Authorization": f"Bearer {lab['token']}"})
 
 
-def chat(messages: list[dict], tools=(), tool_choice: str = "auto") -> dict:
-    """One reply of the agent model (AGENT_MODEL, served on your GPU by `lab serve`), in the OpenAI chat format."""
-    body = dict(model=AGENT_MODEL, messages=messages, **(dict(tools=list(tools), tool_choice=tool_choice) if tools else {}))
+def local_agent_model() -> str | None:
+    """The model the local vLLM serves (lab serve), or None when it does not answer."""
     try:
-        return post(f"{VLLM_URL}/chat/completions", body, {}, timeout=600)
-    except LabError:
-        raise
-    except urllib.error.URLError:
-        raise RuntimeError("the agent model is not running; start it with: lab serve") from None
+        with urllib.request.urlopen(f"{VLLM_URL}/models", timeout=2) as r:
+            return json.load(r)["data"][0]["id"]
+    except (OSError, ValueError, KeyError, IndexError):
+        return None
+
+
+_AGENT: list[tuple[str, dict[str, str], str]] = []  # (chat URL, headers, model), chosen once
+_AGENT_LOCK = threading.Lock()
+
+
+def agent_endpoint() -> tuple[str, dict[str, str], str]:
+    """Where chat sends its messages, chosen once per process and said in one line: the local vLLM when it serves
+    AGENT_MODEL, else the lab server's model (LAB_AGENT_MODEL, within your budget there)."""
+    with _AGENT_LOCK:
+        if not _AGENT:
+            if local_agent_model() == AGENT_MODEL:
+                _AGENT.append((f"{VLLM_URL}/chat/completions", {}, AGENT_MODEL))
+                print(f"agent model: {AGENT_MODEL} on this machine", file=sys.stderr)
+            elif LAB.exists():
+                lab = json.loads(LAB.read_text())
+                _AGENT.append((f"{lab['url']}/v1/chat/completions", {"Authorization": f"Bearer {lab['token']}"}, LAB_AGENT_MODEL))
+                print(f"agent model: {LAB_AGENT_MODEL} through the lab ({AGENT_MODEL} is not running here)", file=sys.stderr)
+            else:
+                raise RuntimeError("no agent model: start one with lab serve (GPU), or connect to the lab with lab connect")
+        return _AGENT[0]
+
+
+def chat(messages: list[dict], tools=(), tool_choice: str = "auto") -> dict:
+    """One reply of the agent model (agent_endpoint), in the OpenAI chat format."""
+    url, headers, model = agent_endpoint()
+    body = dict(model=model, messages=messages, **(dict(tools=list(tools), tool_choice=tool_choice) if tools else {}))
+    return post(url, body, headers, timeout=600)
 
 
 def rerank(ds: Dataset, top: np.ndarray, model: str) -> np.ndarray:
@@ -736,7 +765,44 @@ RERANK_INSTRUCTION = "Given a web search query, retrieve relevant passages that 
 RERANK_TOKENS, RERANK_BATCH = 512, 16
 _RERANKERS: dict[tuple[str, str], tuple] = {}
 _RERANK_DB: list[sqlite3.Connection] = []
+_RERANK_SHIPPED: dict[str, tuple[dict[str, int], np.ndarray, np.ndarray, np.ndarray] | None] = {}
 _RERANK_LOCK = threading.Lock()
+rerank_misses = [0]  # pairs that scored lowest because they were in no cache and there was no GPU to score them
+
+
+def rerank_cache_name(model: str = RERANK_MODEL) -> str:
+    """The file name of model's precomputed scores, a release asset next to the data."""
+    return f"rerank-{model.split('/')[-1]}.npz"
+
+
+def fetch_rerank_cache(model: str = RERANK_MODEL, progress=None) -> pathlib.Path | None:
+    """Downloads model's precomputed scores into the data once; None when the release has none for model."""
+    path = fetch() / rerank_cache_name(model)
+    if not path.exists():
+        part = path.with_name(path.name + ".part")
+        try:
+            download(f"{RELEASE}/{rerank_cache_name(model)}", part, progress)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            raise
+        part.rename(path)
+    return path
+
+
+def question_key(question: str) -> str:
+    return hashlib.sha256(question.encode()).hexdigest()
+
+
+def _shipped(model: str) -> tuple[dict[str, int], np.ndarray, np.ndarray, np.ndarray] | None:
+    """The precomputed scores of model, if downloaded: (question key -> number, offsets, doc ids, scores); question
+    number i's documents and scores are offsets[i] to offsets[i + 1]."""
+    if model not in _RERANK_SHIPPED:
+        path = DATA / DATA_VERSION / rerank_cache_name(model)
+        z = np.load(path) if path.exists() else None
+        _RERANK_SHIPPED[model] = None if z is None else (
+            {k: i for i, k in enumerate(z["questions"].tolist())}, z["offsets"], z["docs"], z["scores"].astype(np.float32))
+    return _RERANK_SHIPPED[model]
 
 
 def _reranker(model: str, device: str) -> tuple:
@@ -752,6 +818,30 @@ def _reranker(model: str, device: str) -> tuple:
     return _RERANKERS[model, device]
 
 
+def rerank_text(ds: Dataset, i: int) -> str:
+    """Document i as the reranker reads it."""
+    return f"{ds.titles[i]}\n{ds.bodies[i]}".strip()
+
+
+def reranker_inputs(model: str, device: str, pairs: list[tuple[str, str]]) -> list[list[int]]:
+    """The token ids of (question, document text) pairs as the reranker reads them: at most RERANK_TOKENS each."""
+    tok, _, _, _, prefix, suffix = _reranker(model, device)
+    texts = [f"<Instruct>: {RERANK_INSTRUCTION}\n<Query>: {q}\n<Document>: {d}" for q, d in pairs]
+    enc = tok(texts, truncation=True, max_length=RERANK_TOKENS - len(prefix) - len(suffix), add_special_tokens=False)
+    return [prefix + x + suffix for x in enc["input_ids"]]
+
+
+def reranker_scores(model: str, device: str, inputs: list[list[int]]) -> list[float]:
+    """The log-odds of "yes" for one batch of reranker_inputs."""
+    import torch
+
+    tok, lm, yes, no, _, _ = _reranker(model, device)
+    padded = tok.pad({"input_ids": inputs}, padding=True, return_tensors="pt").to(device)
+    with torch.inference_mode():
+        logits = lm(**padded, logits_to_keep=1).logits[:, -1, :]
+    return (logits[:, yes].float() - logits[:, no].float()).cpu().tolist()
+
+
 def _rerank_db() -> sqlite3.Connection:
     if not _RERANK_DB:
         DATA.mkdir(exist_ok=True)
@@ -762,31 +852,45 @@ def _rerank_db() -> sqlite3.Connection:
     return _RERANK_DB[0]
 
 
-def rerank_local(ds: Dataset, question: str, rows, model: str = RERANK_MODEL, device: str = "cuda") -> np.ndarray:
+def _cuda() -> bool:
+    import torch
+
+    return torch.cuda.is_available()
+
+
+def rerank_local(ds: Dataset, question: str, rows, model: str = RERANK_MODEL, device: str | None = None) -> np.ndarray:
     """Qwen3-Reranker's log-odds that each document in rows (its title and body) answers question, in rows' order: the
     logit of "yes" minus the logit of "no" (probability = 1 / (1 + e^-score), which rounds to 1 for many documents
-    where the log-odds still differ). The model loads once, on first use, and reads the first 512 tokens of each pair; every (model, question, document)
-    score is kept in data/rerank.sqlite, so a pair is scored once."""
+    where the log-odds still differ). Scores come from the precomputed cache (lab setup downloads it), then from
+    data/rerank.sqlite, then from the model on device (default: the GPU), which loads once and reads the first 512
+    tokens of each pair. Without a GPU, a pair in no cache gets the lowest score of the call."""
     ids = [ds.ids[i] for i in rows]
     with _RERANK_LOCK:
+        known: dict[str, float] = {}
+        shipped = _shipped(model)
+        k = shipped[0].get(question_key(question)) if shipped else None
+        if k is not None:
+            _, offsets, docs, scores = shipped
+            known.update(zip(docs[offsets[k]:offsets[k + 1]].tolist(), scores[offsets[k]:offsets[k + 1]].tolist()))
         db = _rerank_db()
-        known = dict(db.execute(f"SELECT doc, score FROM scores WHERE model = ? AND question = ? AND doc IN "
-                                f"({','.join('?' * len(ids))})", [model, question, *ids])) if ids else {}
+        rest = [d for d in ids if d not in known]
+        if rest:
+            known.update(db.execute(f"SELECT doc, score FROM scores WHERE model = ? AND question = ? AND doc IN "
+                                    f"({','.join('?' * len(rest))})", [model, question, *rest]))
         todo = sorted({d for d in ids if d not in known}, key=lambda d: len(ds.bodies[ds.row[d]]))
-        if todo:
-            import torch
-
-            tok, lm, yes, no, prefix, suffix = _reranker(model, device)
+        device = device or ("cuda" if todo and _cuda() else None)
+        if todo and device is None:
+            lowest = min((known[d] for d in ids if d in known), default=0.0)
+            if not rerank_misses[0]:
+                print(f"rerank_local: {len(todo)} of {len(ids)} pairs are not in the reranker cache and score lowest (no GPU "
+                      f"to score them); lab.rerank_misses[0] counts them from here on", file=sys.stderr)
+            rerank_misses[0] += len(todo)
+            known.update(dict.fromkeys(todo, lowest))
+        elif todo:
             for a in range(0, len(todo), RERANK_BATCH):
                 batch = todo[a:a + RERANK_BATCH]
-                docs = [f"{ds.titles[ds.row[d]]}\n{ds.bodies[ds.row[d]]}".strip() for d in batch]
-                texts = [f"<Instruct>: {RERANK_INSTRUCTION}\n<Query>: {question}\n<Document>: {x}" for x in docs]
-                enc = tok(texts, truncation=True, max_length=RERANK_TOKENS - len(prefix) - len(suffix), add_special_tokens=False)
-                padded = tok.pad({"input_ids": [prefix + x + suffix for x in enc["input_ids"]]}, padding=True,
-                                 return_tensors="pt").to(device)
-                with torch.inference_mode():
-                    logits = lm(**padded, logits_to_keep=1).logits[:, -1, :]
-                odds = (logits[:, yes].float() - logits[:, no].float()).cpu().tolist()
+                odds = reranker_scores(model, device, reranker_inputs(model, device, [(question, rerank_text(ds, ds.row[d]))
+                                                                                       for d in batch]))
                 known.update(zip(batch, odds))
                 db.executemany("INSERT OR REPLACE INTO scores VALUES (?, ?, ?, ?)", [(model, question, d, s) for d, s in zip(batch, odds)])
             db.commit()
