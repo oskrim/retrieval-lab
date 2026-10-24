@@ -39,8 +39,8 @@ QUERY_MODEL, QUERY_REVISION = "perplexity-ai/pplx-embed-v1-0.6b", "2c4d510dd4a73
 RERANK_MODEL = "Qwen/Qwen3-Reranker-4B"  # in-process on your GPU (rerank_local)
 AGENT_MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"  # served by vLLM on your GPU (lab serve, chat)
 VLLM_VERSION = "0.31.0"
-AGENT_THREADS = 16  # agent questions in flight (one chat call each): vLLM's batch, and the lab server's limit per nick
-VLLM_ARGS = ("--max-model-len", "32768", "--max-num-seqs", str(AGENT_THREADS), "--enable-auto-tool-choice", "--trust-remote-code",
+AGENT_THREADS = 8  # agent questions in flight (one chat call each); vLLM batches up to 16
+VLLM_ARGS = ("--max-model-len", "32768", "--max-num-seqs", "16", "--no-enable-prefix-caching", "--enable-auto-tool-choice", "--trust-remote-code",
              "--tool-call-parser", "qwen3_coder", "--reasoning-parser-plugin", "{snapshot}/nano_v3_reasoning_parser.py",
              "--reasoning-parser", "nano_v3", "--reasoning-config",
              '{"reasoning_start_str": "<think>", "reasoning_end_str": "</think>"}')  # {snapshot}: the model's download
@@ -821,7 +821,8 @@ def chat(messages: list[dict], tools=(), tool_choice: str = "auto") -> dict:
     try:
         return post(url, body, headers, timeout=600)
     except LabError as e:
-        raise ModelError(f"the agent model {model} answered {e.status}: {e.detail}") from None
+        hint = "; if lab status shows vLLM down, run lab serve again" if model == AGENT_MODEL and e.status >= 500 else ""
+        raise ModelError(f"the agent model {model} answered {e.status}: {e.detail}{hint}") from None
     except (OSError, ValueError) as e:  # unreachable, or a reply that is not JSON
         raise ModelError(f"the agent model {model} at {url} failed ({e}); lab status shows whether it is up") from None
 
