@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -16,7 +18,9 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 
 import numpy as np
 from rich.console import Console, Group
@@ -38,6 +42,7 @@ TEMPLATES = lab.HERE / "templates"
 MIN_FREE_GB = 60
 LABEL_CHARS = 60  # the lab's limit on a submission's label
 EVAL_SETS = (("fiqa", "dev"), ("caiq", "test"))  # caiq has no dev split
+EVAL_LABELS = [f"{name} {split}" for name, split in EVAL_SETS]
 BOARD_DATASET = "fiqa"
 console = Console(theme=Theme({"ok": "green", "err": "bold red", "warn": "yellow", "acc": "cyan", "dim": "grey50",
                                "num": "bold", "me": "bold cyan", "grade2": "bold green"}), highlight=False)
@@ -195,34 +200,67 @@ def checked_answer(module, path: pathlib.Path):
 # ---- eval history
 
 def history() -> list[dict]:
-    """The earlier evals; a line cut short (a full disk, an interrupted write) is skipped."""
+    """The earlier evals on this version of the data. A line that is not one (cut short by a full disk or an
+    interrupted write, or edited by hand) is skipped."""
     if not EVALS.exists():
         return []
     rows = []
-    for line in EVALS.read_text().splitlines():
+    for line in EVALS.read_text(errors="replace").splitlines():
         try:
-            rows.append(json.loads(line))
+            r = json.loads(line)
         except ValueError:
             continue
+        if (isinstance(r, dict) and all(isinstance(r.get(k), str) for k in ("file", "kind", "dataset"))
+                and all(isinstance(r.get(k), (int, float)) for k in ("at", "score"))
+                and r.get("data", lab.DATA_VERSION) == lab.DATA_VERSION):
+            rows.append(r)
     return rows
 
 
-def best_before(kind: str, dataset: str) -> dict | None:
-    rows = [r for r in history() if r.get("kind") == kind and r.get("dataset") == dataset]
-    return max(rows, key=lambda r: r["score"], default=None)
+def previous(past: list[dict], kind: str, dataset: str, file: str) -> dict | None:
+    """The latest eval of file on dataset."""
+    return max((r for r in past if (r["kind"], r["dataset"], r["file"]) == (kind, dataset, file)),
+               key=lambda r: r["at"], default=None)
 
 
-def remember(path: pathlib.Path, kind: str, dataset: str, score: float, lo: float, hi: float, n: int) -> None:
+def best(past: list[dict], kind: str, dataset: str) -> dict | None:
+    """The highest eval of any file on dataset; the earliest of equal ones."""
+    return max((r for r in past if (r["kind"], r["dataset"]) == (kind, dataset)), key=lambda r: r["score"], default=None)
+
+
+def flips(before: dict | None, per: dict[str, float]) -> tuple[int, int] | None:
+    """How many questions of per scored higher and lower than in the eval before; None when that eval has no
+    per-question scores."""
+    old = before.get("per") if before else None
+    if not isinstance(old, dict):
+        return None
+    pairs = [(old[q], s) for q, s in per.items() if isinstance(old.get(q), (int, float))]
+    return sum(s > o for o, s in pairs), sum(s < o for o, s in pairs)
+
+
+def recent_runs(past: list[dict], kind: str, n: int) -> list[tuple[dict, dict[str, float]]]:
+    """The last n runs of kind, oldest first: one of its evals, and its score per dataset."""
+    runs: dict[tuple, tuple[dict, dict[str, float]]] = {}
+    for r in past:
+        if r["kind"] == kind:  # a run's datasets share "run"; older lines share their file and second
+            runs.setdefault((r["file"], r.get("run", int(r["at"]))), (r, {}))[1][r["dataset"]] = r["score"]
+    return sorted(runs.values(), key=lambda run: run[0]["at"])[-n:]
+
+
+SPARKS = "▁▂▃▄▅▆▇█"
+
+
+def sparkline(values: list[float]) -> str:
+    lo, hi = min(values), max(values)
+    return "".join(SPARKS[round((v - lo) / (hi - lo) * 7) if hi > lo else 3] for v in values)
+
+
+def remember(path: pathlib.Path, kind: str, run: float, result: Result) -> None:
     HOME.mkdir(parents=True, exist_ok=True)
     with open(EVALS, "a") as f:
-        f.write(json.dumps(dict(at=time.time(), file=str(path), kind=kind, dataset=dataset, score=score, lo=lo, hi=hi,
-                                questions=n)) + "\n")
-
-
-def before_cell(r: dict | None) -> str:
-    if r is None:
-        return "[dim]–[/]"
-    return f"{r['score']:.3f}  [dim]{pathlib.Path(r['file']).name} · {time.strftime('%a %H:%M', time.localtime(r['at']))}[/]"
+        f.write(json.dumps(dict(at=time.time(), run=run, file=str(path), kind=kind, data=lab.DATA_VERSION,
+                                dataset=result.dataset, score=result.score, lo=result.lo, hi=result.hi,
+                                questions=len(result.per), per=result.per)) + "\n")
 
 
 def progress(*extra) -> Progress:
@@ -230,14 +268,111 @@ def progress(*extra) -> Progress:
                     TimeElapsedColumn(), console=console, transient=True)
 
 
+# ---- the eval screen
+
+@dataclass
+class Result:
+    dataset: str
+    per: dict[str, float]  # question -> its score, rounded as evals.jsonl keeps it
+    score: float
+    lo: float
+    hi: float
+
+
+def result(dataset: str, per: dict[str, float]) -> Result:
+    x = np.array(list(per.values()), dtype=float)
+    lo, hi = lab.bootstrap(x)
+    return Result(dataset, {q: round(float(s), 4) for q, s in per.items()}, float(x.mean()), lo, hi)
+
+
+def when(at: float) -> str:
+    """The time of day, with the weekday unless it is today."""
+    t = time.localtime(at)
+    return time.strftime("%H:%M" if t[:3] == time.localtime()[:3] else "%a %H:%M", t)
+
+
+def short(file: str, width: int = 16) -> str:
+    name = pathlib.Path(file).name
+    return name if len(name) <= width else name[:width - 1] + "…"
+
+
+def earlier(r: dict | None, file: bool = True) -> Text:
+    """An earlier eval's score, time and file, or a dash."""
+    if r is None:
+        return Text("–", style="dim")
+    return Text.assemble(f"{r['score']:.3f}", (f" {when(r['at'])}" + (f" {short(r['file'])}" if file else ""), "dim"))
+
+
+def result_table(path: pathlib.Path, kind: str, metric: str, results: list[Result], past: list[dict],
+                 elapsed: float, caption: str = "") -> Table:
+    """This run's scores, each next to the previous eval of the same file and the best earlier eval of any file."""
+    cells, record = [], False
+    for r in results:
+        before, top = previous(past, kind, r.dataset, str(path)), best(past, kind, r.dataset)
+        moved = flips(before, r.per)
+        new_best = top is not None and r.score > top["score"]
+        record |= new_best
+        cells.append([Text(r.dataset), Text.assemble((f"{r.score:.3f}", "num"), (" ★", "ok") if new_best else "  "),
+                      Text(f"{r.lo:.3f}–{r.hi:.3f}"),
+                      Text.assemble((f"↑{moved[0]}", "ok"), " ", (f"↓{moved[1]}", "err")) if moved else Text("–", "dim"),
+                      earlier(before, file=False), earlier(top)])
+    table = Table(title=f"{path.name} · {metric} · {elapsed:.1f} s", title_justify="left", title_style="bold",
+                  box=None, padding=(0, 1), caption_style="dim", caption_justify="left")
+    for i, (header, justify) in enumerate(((("dataset", "left"), (metric, "right"), ("95% interval", "right"),
+                                            ("↑ ↓", "right"), ("previous", "left"), ("best before", "left")))):
+        # in a narrow terminal only the last column gives way, cutting its file name short
+        width = max([len(header)] + [c[i].cell_len for c in cells]) if i < 5 else None
+        table.add_column(header, justify=justify, header_style="dim", no_wrap=True, overflow="ellipsis", min_width=width)
+    for c in cells:
+        table.add_row(*c)
+    notes = [f"previous: the last eval of {path.name} · ↑ ↓ questions now higher, lower"]
+    if record:
+        notes.append("★ above every earlier eval")
+    table.caption = "\n".join(([caption] if caption else []) + notes)
+    return table
+
+
+def runs_table(kind: str, datasets: list[str], past: list[dict], n: int = 5, trend: int = 20) -> Table | None:
+    """The last n earlier runs of kind, oldest first, and a sparkline of each dataset over the last trend runs."""
+    runs = recent_runs(past, kind, trend)
+    if not runs:
+        return None
+    table = Table(title="earlier evals", title_justify="left", title_style="dim", box=None, padding=(0, 1))
+    table.add_column("", style="dim", no_wrap=True)
+    table.add_column("file", no_wrap=True, overflow="ellipsis", max_width=24)
+    for d in datasets:
+        table.add_column(d, justify="right", header_style="dim", no_wrap=True)
+    for first, scores in runs[-n:]:
+        table.add_row(when(first["at"]), short(first["file"], 24),
+                      *(f"{scores[d]:.3f}" if d in scores else Text("–", "dim") for d in datasets))
+    lines = [[scores[d] for _, scores in runs if d in scores] for d in datasets]
+    if any(len(v) > 1 for v in lines):
+        table.add_row(f"last {len(runs)}", "", *(Text(sparkline(v), "acc") if len(v) > 1 else "" for v in lines))
+    return table
+
+
+def show_end(*renderables) -> None:
+    for r in renderables:
+        if r is not None:
+            console.print()
+            console.print(r)
+
+
+def quiet_models() -> None:
+    """No model-loading bars or Hugging Face notices among the eval's output; the CLI reports cache misses itself."""
+    for name, value in (("HF_HUB_DISABLE_PROGRESS_BARS", "1"), ("TRANSFORMERS_VERBOSITY", "error"),
+                        ("HF_HUB_VERBOSITY", "error"), ("TOKENIZERS_PARALLELISM", "false")):
+        os.environ.setdefault(name, value)
+    warnings.simplefilter("ignore", lab.RerankCacheMiss)
+
+
 # ---- eval
 
-def eval_search(path: pathlib.Path, module, worst: int) -> None:
+def eval_search(path: pathlib.Path, module, worst: int, only: str | None) -> None:
     search = checked_search(module, path)
-    sets = []
+    run = time.time()
     with console.status("loading the data"):
-        for name, split in EVAL_SETS:
-            sets.append((f"{name} {split}", lab.load(name, split)))
+        sets = [(f"{name} {split}", lab.load(name, split)) for name, split in EVAL_SETS if only in (None, name)]
     scores, ranked = {}, {}
     with progress(MofNCompleteColumn()) as bar:
         tasks = {label: bar.add_task(label, total=len(ds.qids)) for label, ds in sets}
@@ -247,22 +382,17 @@ def eval_search(path: pathlib.Path, module, worst: int) -> None:
                 ranked[label, q] = rows
                 scores[label, q] = lab.ndcg10([ds.ids[i] for i in rows], ds.qrels[q])
                 bar.advance(tasks[label])
-    table = Table(title=f"{path.name} · nDCG@10", title_justify="left", title_style="bold", box=None, padding=(0, 2))
-    for col, just in (("dataset", "left"), ("questions", "right"), ("nDCG@10", "right"), ("95% interval", "right"),
-                      ("best before", "left")):
-        table.add_column(col, justify=just, header_style="dim")
-    for label, ds in sets:
-        x = np.array([scores[label, q] for q in ds.qids])
-        lo, hi = lab.bootstrap(x)
-        before = best_before("search", label)
-        table.add_row(label, str(len(x)), f"[num]{x.mean():.3f}[/]", f"{lo:.3f} – {hi:.3f}", before_cell(before))
-        remember(path, "search", label, float(x.mean()), lo, hi, len(x))
-    console.print(table)
-    if lab.rerank_misses[0]:
-        console.print(f"[warn]![/] {lab.rerank_misses[0]:,} reranker pairs were in no cache and ranked lowest (no GPU to "
-                      "score them); the scores above are lower than on a GPU")
+    elapsed = time.time() - run
+    results = [result(label, {q: scores[label, q] for q in ds.qids}) for label, ds in sets]
+    past = history()
     if worst:
         show_worst_search(sets, scores, ranked, worst)
+    show_end(runs_table("search", EVAL_LABELS, past), result_table(path, "search", "nDCG@10", results, past, elapsed))
+    if lab.rerank_misses[0]:
+        console.print(f"[warn]![/] {lab.rerank_misses[0]:,} reranker pairs missed the cache and scored lowest (no GPU to "
+                      "score them)")
+    for r in results:
+        remember(path, "search", run, r)
 
 
 def show_worst_search(sets, scores: dict, ranked: dict, n: int) -> None:
@@ -288,42 +418,57 @@ def doc_line(ds: lab.Dataset, prefix: str, i: int, grade: int) -> None:
                   no_wrap=True, overflow="ellipsis")
 
 
+AGENT_SET = "crm dev"
+
+
 def eval_agent(path: pathlib.Path, module, worst: int) -> None:
-    require_agent()
+    with contextlib.redirect_stderr(io.StringIO()):  # the model is named in the caption below
+        url, _, model = require_agent()
+    where = "on this machine" if url.startswith(lab.VLLM_URL) else "through the lab"
     answer = checked_answer(module, path)
     questions = lab.crm_dev()
     found: dict[int, set[str]] = {}
+    run = time.time()
     pool = ThreadPoolExecutor(lab.AGENT_THREADS)
     try:
         with progress(MofNCompleteColumn()) as bar:
-            task = bar.add_task("crm dev", total=len(questions))
+            task = bar.add_task(AGENT_SET, total=len(questions))
             futures = {pool.submit(answer, q): i for i, (q, _) in enumerate(questions)}
             for f in as_completed(futures):
                 found[futures[f]] = f.result()
                 bar.advance(task)
     finally:
         pool.shutdown(wait=False, cancel_futures=True)  # an error or Ctrl-C does not wait for the running agents
-    exact = np.array([found[i] == gold for i, (_, gold) in enumerate(questions)], dtype=float)
-    lo, hi = lab.bootstrap(exact)
-    for (q, _), e in zip(questions, exact):
-        console.print(Text.assemble("  ", ("✓ ", "ok") if e else ("✗ ", "err"), q))
-    table = Table(title=f"\n{path.name} · exact set", title_justify="left", title_style="bold", box=None, padding=(0, 2))
-    for col, just in (("questions", "right"), ("exact", "right"), ("95% interval", "right"), ("best before", "left")):
-        table.add_column(col, justify=just, header_style="dim")
-    table.add_row(str(len(exact)), f"[num]{exact.mean():.3f}[/]", f"{lo:.3f} – {hi:.3f}", before_cell(best_before("agent", "crm dev")))
-    remember(path, "agent", "crm dev", float(exact.mean()), lo, hi, len(exact))
-    console.print(table)
-    for i in [i for i, e in enumerate(exact) if not e][:worst]:
+    elapsed = time.time() - run
+    res = result(AGENT_SET, {q: float(found[i] == gold) for i, (q, gold) in enumerate(questions)})
+    past = history()
+    for i in [i for i, (q, _) in enumerate(questions) if not res.per[q]][:worst]:
         q, gold = questions[i]
         console.print(Text.assemble("\n", ("✗ ", "err"), q))
         console.print(f"  [dim]expected[/] {', '.join(sorted(gold)) or 'none'}")
         console.print(f"  [dim]missing [/] {', '.join(sorted(gold - found[i])) or '–'}")
         console.print(f"  [dim]extra   [/] {', '.join(sorted(found[i] - gold)) or '–'}")
+    last = (previous(past, "agent", AGENT_SET, str(path)) or {}).get("per")
+    console.print()
+    for q, _ in questions:
+        was = last.get(q) if isinstance(last, dict) else None
+        moved = ("↑ ", "ok") if was == 0 and res.per[q] else ("↓ ", "err") if was == 1 and not res.per[q] else "  "
+        console.print(Text.assemble("  ", ("✓ ", "ok") if res.per[q] else ("✗ ", "err"), moved, q),
+                      no_wrap=True, overflow="ellipsis")
+    show_end(runs_table("agent", [AGENT_SET], past),
+             result_table(path, "agent", "exact", [res], past, elapsed, f"agent model {model} {where}"))
+    remember(path, "agent", run, res)
 
 
 def cmd_eval(args) -> None:
+    quiet_models()
     path, module = load_file(args.file)
-    (eval_search if file_kind(module) == "search" else eval_agent)(path, module, args.worst)
+    if file_kind(module) == "search":
+        eval_search(path, module, args.worst, args.data)
+    elif args.data:
+        raise Fail("--data picks a search dataset; an agent file runs on the CRM questions")
+    else:
+        eval_agent(path, module, args.worst)
 
 
 # ---- submit
@@ -332,6 +477,7 @@ def cmd_submit(args) -> None:
     label = args.m.strip()
     if not 1 <= len(label) <= LABEL_CHARS:
         raise Fail(f"-m: a label of 1 to {LABEL_CHARS} characters on what your file does (yours has {len(label)})")
+    quiet_models()
     path, module = load_file(args.file)
     kind = file_kind(module)
     with progress(TextColumn("{task.completed} questions")) as bar:
@@ -494,10 +640,11 @@ def download(what: str, path: pathlib.Path, fetch) -> pathlib.Path | None:
     return path
 
 
-def require_agent() -> None:
-    """Fails unless chat has a model: the local vLLM, or the lab server."""
+def require_agent() -> tuple[str, dict[str, str], str]:
+    """Where chat sends its messages (lab.agent_endpoint); fails unless it has a model: the local vLLM, or the lab
+    server."""
     try:
-        lab.agent_endpoint()
+        return lab.agent_endpoint()
     except RuntimeError as e:
         raise Fail(str(e)) from None
 
@@ -680,6 +827,7 @@ def parser() -> argparse.ArgumentParser:
     s = sub.add_parser("eval", help="score your file on the dev questions")
     s.add_argument("file")
     s.add_argument("--worst", type=int, default=0, metavar="N", help="also show the N worst questions")
+    s.add_argument("--data", choices=[name for name, _ in EVAL_SETS], help="only this dataset (search files)")
     s.set_defaults(run=cmd_eval)
     s = sub.add_parser("submit", help="run your file on the board's questions and send the results")
     s.add_argument("file")

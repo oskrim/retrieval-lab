@@ -1,5 +1,7 @@
 """pytest -p no:xdist tests"""
 
+import json
+import os
 import pathlib
 import sys
 import textwrap
@@ -7,8 +9,11 @@ import threading
 
 import numpy as np
 import pytest
+from rich.cells import cell_len
 
 import cli
+
+FAKE_ENDPOINT = ("http://localhost:8000/v1/chat/completions", {}, "fake-model")
 
 
 def write(tmp_path: pathlib.Path, name: str, code: str) -> pathlib.Path:
@@ -82,7 +87,7 @@ def test_syntax_errors_point_at_the_line(tmp_path):
 
 def test_main_exits_nonzero_without_a_cli_traceback(tmp_path, capsys, monkeypatch):
     path = write(tmp_path, "boom.py", "def answer(question):\n    raise ValueError('boom')\n")
-    monkeypatch.setattr(cli, "require_agent", lambda: None)
+    monkeypatch.setattr(cli, "require_agent", lambda: FAKE_ENDPOINT)
     monkeypatch.setattr(cli, "HOME", tmp_path)
     assert cli.main(["eval", str(path)]) == 1
     out = capsys.readouterr().out
@@ -112,13 +117,87 @@ def test_errors_in_a_helper_module_beside_the_file_show_its_line(tmp_path, capsy
     assert "mine.py:4 in search" in out and "helpers.py:2 in rows" in out and "lab.py" not in out
 
 
-def test_eval_history_skips_a_line_cut_short(tmp_path, monkeypatch):
+@pytest.fixture
+def evals(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "HOME", tmp_path)
     monkeypatch.setattr(cli, "EVALS", tmp_path / "evals.jsonl")
-    cli.remember(tmp_path / "a.py", "search", "fiqa dev", 0.5, 0.4, 0.6, 500)
-    with open(cli.EVALS, "a") as f:
-        f.write('{"at": 1, "file": "b.py", "kind": "sea')
-    assert cli.best_before("search", "fiqa dev")["score"] == 0.5
+    return cli.EVALS
+
+
+def ev(at, file, score, dataset="fiqa dev", kind="search", **more):
+    return dict(at=at, file=file, kind=kind, dataset=dataset, score=score, **more)
+
+
+def test_eval_history_skips_lines_that_are_not_evals(evals):
+    cli.remember(pathlib.Path("/w/a.py"), "search", 1.0, cli.Result("fiqa dev", {"q1": 1.0, "q2": 0.0}, 0.5, 0.4, 0.6))
+    legacy = ev(2, "/w/b.py", 0.4)  # written before evals.jsonl kept the data version
+    with open(evals, "a") as f:
+        for line in ['{"at": 1, "file": "b.py", "kind": "sea', "3", "[]", json.dumps(ev(3, "/w/c.py", "high")),
+                     json.dumps(dict(at=4, file="/w/d.py", kind="search", dataset="fiqa dev")),
+                     json.dumps(ev(5, "/w/e.py", 0.9, data="data-v1")), json.dumps(legacy), "\x00\xff"]:
+            f.write(line + "\n")
+    rows = cli.history()
+    assert [r["file"] for r in rows] == ["/w/a.py", "/w/b.py"]
+    assert rows[0]["per"] == {"q1": 1.0, "q2": 0.0} and rows[0]["questions"] == 2 and rows[0]["run"] == 1.0
+
+
+def test_previous_is_the_latest_eval_of_the_file_and_best_the_highest_of_any_file():
+    rows = [ev(1, "/w/a.py", 0.50), ev(2, "/w/b.py", 0.60), ev(3, "/w/a.py", 0.40), ev(4, "/w/c.py", 0.60),
+            ev(5, "/w/a.py", 0.90, dataset="caiq test"), ev(6, "/w/a.py", 0.99, kind="agent", dataset="crm dev")]
+    assert cli.previous(rows, "search", "fiqa dev", "/w/a.py")["at"] == 3
+    assert cli.previous(rows, "search", "fiqa dev", "/w/new.py") is None
+    assert cli.best(rows, "search", "fiqa dev")["at"] == 2  # the earliest of two equal bests
+    assert cli.best(rows, "search", "caiq test")["at"] == 5
+    assert cli.best(rows, "agent", "fiqa dev") is None
+
+
+def test_flips_count_the_questions_that_scored_higher_and_lower():
+    before = ev(1, "/w/a.py", 0.5, per={"a": 0.5, "b": 0.2, "c": 1.0, "gone": 0.3})
+    assert cli.flips(before, {"a": 0.7, "b": 0.2, "c": 0.0, "new": 1.0}) == (1, 1)
+    assert cli.flips(ev(1, "/w/a.py", 0.5), {"a": 1.0}) is None  # an eval from before per-question scores
+    assert cli.flips(None, {"a": 1.0}) is None
+
+
+def test_recent_runs_group_a_runs_datasets_oldest_first():
+    rows = [ev(10.1, "/w/a.py", 0.5), ev(10.2, "/w/a.py", 0.7, dataset="caiq test"),  # one run without a run id
+            ev(20.0, "/w/a.py", 0.6, run=20.0), ev(20.5, "/w/a.py", 0.8, dataset="caiq test", run=20.0),
+            ev(30.0, "/w/b.py", 0.55, run=30.0), ev(31.0, "/w/a.py", 0.9, kind="agent", dataset="crm dev", run=31.0)]
+    runs = cli.recent_runs(rows, "search", 5)
+    assert [(r["file"], scores) for r, scores in runs] == [
+        ("/w/a.py", {"fiqa dev": 0.5, "caiq test": 0.7}), ("/w/a.py", {"fiqa dev": 0.6, "caiq test": 0.8}),
+        ("/w/b.py", {"fiqa dev": 0.55})]
+    assert [r["at"] for r, _ in cli.recent_runs(rows, "search", 2)] == [20.0, 30.0]
+
+
+def test_sparkline():
+    assert cli.sparkline([0.1, 0.5, 0.3]) == "▁█▄"
+    assert cli.sparkline([0.5, 0.5]) == "▄▄"
+
+
+def test_the_result_screen_fits_80_columns(evals):
+    rows = [ev(1, "/w/search.py", 0.55, run=1, per={"q1": 0.5, "q2": 1.0}),
+            ev(1, "/w/search.py", 0.70, dataset="caiq test", run=1),
+            ev(2, "/w/a_rather_long_file_name_for_search.py", 0.60, run=2)]
+    results = [cli.result("fiqa dev", {"q1": 0.25, "q2": 1.0}), cli.result("caiq test", {"q9": 1.0})]
+    out = cli.Console(width=80, record=True, file=open(os.devnull, "w"))
+    out.print(cli.runs_table("search", cli.EVAL_LABELS, rows))
+    out.print(cli.result_table(pathlib.Path("/w/search.py"), "search", "nDCG@10", results, rows, 3.2))
+    text = out.export_text()
+    assert max(map(cell_len, text.splitlines())) <= 80
+    assert "↑0 ↓1" in text and "★" in text and "0.600 " in text and "a_rather" in text
+    assert "0.550" in text and "–" in text  # the previous eval of search.py; no flips without per-question scores
+
+
+def test_agent_eval_marks_the_questions_that_flipped(tmp_path, evals, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "require_agent", lambda: FAKE_ENDPOINT)
+    monkeypatch.setattr(cli.lab, "crm_dev", lambda: [("first question", {"D0001"}), ("second question", {"D0002"})])
+    path = tmp_path / "agent.py"
+    for found in ("{'D0001'}", "{'D0002'}  # a size of its own: Python checks the cached bytecode by size and second"):
+        path.write_text(f"def answer(question):\n    return {found}\n")
+        assert cli.main(["eval", str(path)]) == 0
+    out = capsys.readouterr().out.split("first question")[-1]
+    assert "✓ ↑ second question" in out and "↑1 ↓1" in out and "fake-model" in out
+    assert [r["score"] for r in cli.history()] == [0.5, 0.5]
 
 
 @pytest.mark.parametrize("label", ["", "   ", "x" * (cli.LABEL_CHARS + 1)])
@@ -180,7 +259,7 @@ def test_model_errors_are_not_blamed_on_the_participant(tmp_path, capsys, monkey
         def answer(question):
             raise lab.ModelError("the agent model Qwen/Qwen3.5-9B answered 500: CUDA out of memory")
     """)
-    monkeypatch.setattr(cli, "require_agent", lambda: None)
+    monkeypatch.setattr(cli, "require_agent", lambda: FAKE_ENDPOINT)
     monkeypatch.setattr(cli, "HOME", tmp_path)
     assert cli.main(["eval", str(path)]) == 1
     out = capsys.readouterr().out

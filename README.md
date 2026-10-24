@@ -24,7 +24,7 @@ Then, in a second SSH session (`source .venv/bin/activate` first):
 
 ```bash
 lab new search                          # a working search.py: hybrid candidates, then the reranker
-lab eval search.py                      # nDCG@10 on the dev questions, next to your best so far
+lab eval search.py                      # nDCG@10 on the dev questions, next to your previous and best evals
 lab eval search.py --worst 5            # ... and the 5 worst questions with your top 10
 lab submit search.py -m "what changed"  # the leaderboard's questions; prints your score and rank
 lab board --watch

@@ -2,6 +2,7 @@
 
   lab eval search.py                       nDCG@10 on the dev questions, with a 95% interval
   lab eval search.py --worst 5             ... and the 5 worst questions with your top 10
+  lab eval search.py --data caiq           only one dataset (fiqa or caiq)
   lab submit search.py -m "what changed"   runs it on the leaderboard's FiQA questions
 
 As it is, candidates are the notebook's hybrid (BM25 + dense vectors, fused), and the score mixes the hybrid's order
