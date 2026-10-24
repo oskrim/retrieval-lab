@@ -33,11 +33,11 @@ DATA_VERSION = "data-v8"
 RELEASE = f"https://github.com/oskrim/retrieval-lab/releases/download/{DATA_VERSION}"
 LATE_MODEL = "perplexity-ai/pplx-embed-v2-late-0.6b"
 QUERY_MODEL, QUERY_REVISION = "perplexity-ai/pplx-embed-v1-0.6b", "2c4d510dd4a732063c31a0f70193e35067b51fd8"
-RERANK_MODEL = "Qwen/Qwen3-Reranker-0.6B"  # in-process on your GPU (rerank_local)
+RERANK_MODEL = "Qwen/Qwen3-Reranker-4B"  # in-process on your GPU (rerank_local)
 AGENT_MODEL = "Qwen/Qwen3.5-9B"  # served by vLLM on your GPU (lab serve, chat)
 VLLM_VERSION = "0.31.0"
 VLLM_ARGS = ("--max-model-len", "32768", "--gpu-memory-utilization", "0.6", "--enable-auto-tool-choice",
-             "--tool-call-parser", "hermes")
+             "--tool-call-parser", "qwen3_coder", "--reasoning-parser", "qwen3")
 VLLM_URL = "http://localhost:8000/v1"
 LAB_AGENT_MODEL = "deepseek-v4-flash"  # the lab server's agent model, for machines without a GPU
 LAB = HERE / ".lab.json"
@@ -1138,6 +1138,8 @@ def embed(texts: list[str]) -> np.ndarray:
     on first use) on your GPU if you have one, else the CPU; mean pooling over at most 512 tokens, float32."""
     if not texts:
         return np.zeros((0, 1024), dtype=np.float32)
+    if not all(t.strip() for t in texts):
+        raise ValueError("cannot embed an empty text")
     import torch  # loaded on the first question only
     from sentence_transformers import SentenceTransformer
 

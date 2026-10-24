@@ -1,7 +1,7 @@
 """Maintainer script: precomputes the reranker's scores for every question the lab asks, so machines without a GPU
 can rerank from the cache (lab.rerank_local). Run it on a GPU machine with the data downloaded (lab setup):
 
-  python tools/rerank_cache.py --board-questions board.json [--model Qwen/Qwen3-Reranker-0.6B]
+  python tools/rerank_cache.py --board-questions board.json [--model Qwen/Qwen3-Reranker-0.6B]  (default: lab.RERANK_MODEL)
 
 Questions: fiqa dev and test, caiq test, and the leaderboard's (board.json: [{"id", "text"}], fetched from the server).
 Documents per question: the top 100 of lab.hybrid as the template calls it, with BM25 only and with dense only, the
