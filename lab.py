@@ -39,7 +39,8 @@ QUERY_MODEL, QUERY_REVISION = "perplexity-ai/pplx-embed-v1-0.6b", "2c4d510dd4a73
 RERANK_MODEL = "Qwen/Qwen3-Reranker-4B"  # in-process on your GPU (rerank_local)
 AGENT_MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"  # served by vLLM on your GPU (lab serve, chat)
 VLLM_VERSION = "0.31.0"
-VLLM_ARGS = ("--max-model-len", "32768", "--max-num-seqs", "16", "--enable-auto-tool-choice", "--trust-remote-code",
+AGENT_THREADS = 16  # agent questions in flight (one chat call each): vLLM's batch, and the lab server's limit per nick
+VLLM_ARGS = ("--max-model-len", "32768", "--max-num-seqs", str(AGENT_THREADS), "--enable-auto-tool-choice", "--trust-remote-code",
              "--tool-call-parser", "qwen3_coder", "--reasoning-parser-plugin", "{snapshot}/nano_v3_reasoning_parser.py",
              "--reasoning-parser", "nano_v3", "--reasoning-config",
              '{"reasoning_start_str": "<think>", "reasoning_end_str": "</think>"}')  # {snapshot}: the model's download
@@ -1118,7 +1119,7 @@ def submit_agent(answer_with, label: str) -> dict:
     """Runs answer_with(question) (a set of deal ids) on the agent leaderboard's CRM questions and sends the
     answers; the lab scores the share answered exactly and keeps your best. label: a few words on what your agent does."""
     qs = call("/api/agent-board/questions")["questions"]
-    found = parallel_map(lambda q: sorted(answer_with(q["text"])), qs)
+    found = parallel_map(lambda q: sorted(answer_with(q["text"])), qs, threads=AGENT_THREADS)
     return call("/api/agent-board", dict(label=label, answers={q["id"]: f for q, f in zip(qs, found)}))
 
 

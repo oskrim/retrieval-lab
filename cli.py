@@ -293,7 +293,7 @@ def eval_agent(path: pathlib.Path, module, worst: int) -> None:
     answer = checked_answer(module, path)
     questions = lab.crm_dev()
     found: dict[int, set[str]] = {}
-    pool = ThreadPoolExecutor(8)
+    pool = ThreadPoolExecutor(lab.AGENT_THREADS)
     try:
         with progress(MofNCompleteColumn()) as bar:
             task = bar.add_task("crm dev", total=len(questions))
