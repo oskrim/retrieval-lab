@@ -18,6 +18,7 @@ import tarfile
 import threading
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -635,18 +636,38 @@ def post(url: str, body: dict | None, headers: dict[str, str], timeout: float = 
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.load(r)
     except urllib.error.HTTPError as e:
-        text = e.read().decode(errors="replace")
-        try:
-            detail = json.loads(text)["detail"]
-        except (ValueError, KeyError, TypeError):
-            detail = text
-        raise LabError(e.code, detail if isinstance(detail, str) else json.dumps(detail)) from None
+        raise LabError(e.code, error_detail(e.read().decode(errors="replace")) or str(e.reason)) from None
+
+
+def error_detail(text: str) -> str:
+    """The reason in an error reply: FastAPI's {"detail"}, OpenAI's {"error": {"message"}}, vLLM's {"message"}, else
+    the start of the text."""
+    try:
+        body = json.loads(text)
+        detail = body.get("detail") or (body.get("error") or {}).get("message") or body["message"]
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return " ".join(text.split())[:300]
+    return detail if isinstance(detail, str) else json.dumps(detail)
 
 
 def connect(url: str, token: str) -> str:
-    """Saves the lab URL and your token; returns your nickname."""
-    LAB.write_text(json.dumps(dict(url=url.rstrip("/"), token=token)))
-    return call("/api/me")["nick"]
+    """Checks the lab URL and your token, then saves them; returns your nickname. A refused pair leaves the saved
+    connection as it was."""
+    url = url.strip().rstrip("/")
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+        raise RuntimeError(f"{url} is not a lab URL; copy the one on your lab page (it starts with https://)")
+    try:
+        nick = post(url + "/api/me", None, {"Authorization": f"Bearer {token.strip()}"})["nick"]
+    except LabError as e:
+        if e.status == 401:
+            raise RuntimeError("the lab refused the token; copy URL and token again from your lab page") from None
+        if e.status == 404:
+            raise RuntimeError(f"no lab at {url}; copy the URL from your lab page, without /home or a path") from None
+        raise
+    except (ValueError, KeyError, TypeError):
+        raise RuntimeError(f"{url} did not answer as a lab; copy the URL from your lab page") from None
+    LAB.write_text(json.dumps(dict(url=url, token=token.strip())))
+    return nick
 
 
 def call(path: str, body: dict | None = None) -> dict:
@@ -686,11 +707,20 @@ def agent_endpoint() -> tuple[str, dict[str, str], str]:
         return _AGENT[0]
 
 
+class ModelError(RuntimeError):
+    """The agent model refused a request or could not be reached."""
+
+
 def chat(messages: list[dict], tools=(), tool_choice: str = "auto") -> dict:
     """One reply of the agent model (agent_endpoint), in the OpenAI chat format."""
     url, headers, model = agent_endpoint()
     body = dict(model=model, messages=messages, **(dict(tools=list(tools), tool_choice=tool_choice) if tools else {}))
-    return post(url, body, headers, timeout=600)
+    try:
+        return post(url, body, headers, timeout=600)
+    except LabError as e:
+        raise ModelError(f"the agent model {model} answered {e.status}: {e.detail}") from None
+    except (OSError, ValueError) as e:  # unreachable, or a reply that is not JSON
+        raise ModelError(f"the agent model {model} at {url} failed ({e}); lab status shows whether it is up") from None
 
 
 # ---- one question at a time: the notebook's search as functions, and the local reranker
@@ -893,13 +923,22 @@ def rerank_rows(ds: Dataset, top: np.ndarray, model: str = RERANK_MODEL) -> np.n
     return out
 
 
+def parallel_map(fn, items: list, threads: int = 8) -> list:
+    """fn of each item, in order, on threads. An exception or Ctrl-C cancels the items not yet started and returns
+    without waiting for the running ones: an agent's can take minutes."""
+    pool = ThreadPoolExecutor(threads)
+    try:
+        return list(pool.map(fn, items))
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
 def submit(ds: Dataset, search_with, label: str) -> dict:
     """Runs search_with(ds, question, k=10) (document rows, best first) on the leaderboard's FiQA questions (not in the data) and
     sends the results; the lab scores mean nDCG@10 and keeps your best. label: a few words on what your search does."""
     qs = call("/api/board/questions")["questions"]
     first = search_with(ds, qs[0]["text"], k=10)  # builds the search's indexes once, before the threads start
-    with ThreadPoolExecutor(8) as pool:
-        rows = [first] + list(pool.map(lambda q: search_with(ds, q["text"], k=10), qs[1:]))
+    rows = [first] + parallel_map(lambda q: search_with(ds, q["text"], k=10), qs[1:])
     return call("/api/board", dict(label=label, ranking={q["id"]: [ds.ids[i] for i in r[:10]] for q, r in zip(qs, rows)}))
 
 
@@ -907,8 +946,7 @@ def submit_agent(answer_with, label: str) -> dict:
     """Runs answer_with(question) (a set of deal ids) on the agent leaderboard's CRM questions and sends the
     answers; the lab scores the share answered exactly and keeps your best. label: a few words on what your agent does."""
     qs = call("/api/agent-board/questions")["questions"]
-    with ThreadPoolExecutor(8) as pool:
-        found = list(pool.map(lambda q: sorted(answer_with(q["text"])), qs))
+    found = parallel_map(lambda q: sorted(answer_with(q["text"])), qs)
     return call("/api/agent-board", dict(label=label, answers={q["id"]: f for q, f in zip(qs, found)}))
 
 
@@ -1346,8 +1384,10 @@ def search_crm(query: str = "", filters: dict | None = None, sort_by: str | None
                fields: list[str] | None = None, limit: int = 10, group_by: str | None = None) -> dict:
     """Search on the deals, plus what their attributes allow: filters narrow the deals it searches, sort_by orders the
     results by a number or date, fields picks what comes back, group_by counts the deals per value. total is the number
-    of deals that pass the filters; with a query, the results are the best matches among them."""
-    filters = filters or {}
+    of deals that pass the filters; with a query, the results are the best matches among them. A model may send null
+    for an argument it leaves out (gpt-oss does): that is the default."""
+    query, filters = query or "", filters or {}
+    descending, limit = descending is not False, 10 if limit is None else limit
     unknown = [f for f in [*filters, sort_by, group_by, *(fields or [])] if f is not None and f not in DEALS[0]]
     if unknown:
         return dict(error=f"unknown fields {unknown}; the fields are {list(DEALS[0])}")
@@ -1364,6 +1404,7 @@ def search_crm(query: str = "", filters: dict | None = None, sort_by: str | None
 
 def find_values(text: str, field: str | None = None, k: int = 10) -> list[dict]:
     """The values of the category fields that best match text, e.g. "fintech" -> industry "Financial services"."""
+    k = 10 if k is None else k
     ds = crm_index("crm-values")
     mask = None if field is None else np.array([i.split("=", 1)[0] == field for i in ds.ids])
     return [dict(zip(("field", "value"), ds.ids[i].split("=", 1))) for i in hybrid(ds, text, n=20, mask=mask)[:int(k)]]
@@ -1371,6 +1412,7 @@ def find_values(text: str, field: str | None = None, k: int = 10) -> list[dict]:
 
 def find_fields(text: str, k: int = 3) -> list[dict]:
     """The number and date fields that best match text, e.g. "biggest" -> amount_eur."""
+    k = 3 if k is None else k
     ds = crm_index("crm-fields")
     return [dict(field=ds.ids[i], about=ds.bodies[i]) for i in hybrid(ds, text, n=20)[:int(k)]]
 
@@ -1436,7 +1478,7 @@ def crm_agent(question: str, tools: list[dict], functions: dict, system: str = C
             try:
                 args = json.loads(call_["function"]["arguments"])
                 out = functions[name](**args)
-            except (KeyError, TypeError, ValueError, RuntimeError) as e:  # the model sees the error and can retry
+            except (AttributeError, KeyError, TypeError, ValueError, RuntimeError) as e:  # the model sees the error and can retry
                 out = dict(error=f"{type(e).__name__}: {e}")
             calls.append(name)
             if verbose:
@@ -1445,7 +1487,7 @@ def crm_agent(question: str, tools: list[dict], functions: dict, system: str = C
                                  content=out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)))
         if not msg.get("tool_calls"):
             break
-    answer = msg["content"] or ""
+    answer = msg.get("content") or ""  # None when the model only called tools or only reasoned
     last = re.findall(r"^\W*DEALS:(.*)$", answer, re.M)
     return dict(answer=answer, deals=set(re.findall(r"D\d{4}", last[-1])) if last else set(), calls=calls)
 

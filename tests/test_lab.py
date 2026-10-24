@@ -1,6 +1,10 @@
 """pytest -p no:xdist tests"""
 
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import time
+import urllib.error
 
 import numpy as np
 import pytest
@@ -66,3 +70,116 @@ def test_chat_without_a_model_or_the_lab_says_what_to_do(endpoint):
     endpoint.setattr(lab, "local_agent_model", lambda: None)
     with pytest.raises(RuntimeError, match="lab serve.*lab connect"):
         lab.agent_endpoint()
+
+
+@pytest.mark.parametrize("text, detail", [
+    ('{"detail": "at most 10 submissions per hour"}', "at most 10 submissions per hour"),
+    ('{"error": {"message": "your model budget of $1.00 is used up", "type": "insufficient_quota"}}',
+     "your model budget of $1.00 is used up"),
+    ('{"object": "error", "message": "CUDA out of memory", "code": 500}', "CUDA out of memory"),
+    ("<html>\n<h1>502 Bad Gateway</h1>\n</html>", "<html> <h1>502 Bad Gateway</h1> </html>"),
+    ("", ""),
+])
+def test_error_detail(text, detail):
+    assert lab.error_detail(text) == detail
+
+
+@pytest.mark.parametrize("failure, message", [
+    (lab.LabError(500, "CUDA out of memory"), "answered 500: CUDA out of memory"),
+    (urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")), "lab status shows whether it is up"),
+    (ValueError("Expecting value"), "Expecting value"),
+])
+def test_chat_failures_name_the_agent_model(endpoint, failure, message):
+    endpoint.setattr(lab, "local_agent_model", lambda: lab.AGENT_MODEL)
+
+    def post(*a, **kw):
+        raise failure
+
+    endpoint.setattr(lab, "post", post)
+    with pytest.raises(lab.ModelError, match=message):
+        lab.chat([dict(role="user", content="hi")])
+
+
+def test_connect_saves_only_a_working_url_and_token(endpoint):
+    saved = json.dumps(dict(url="https://lab.example", token="good"))
+    lab.LAB.write_text(saved)
+
+    def post(url, body, headers, timeout=120):
+        if headers["Authorization"] != "Bearer good":
+            raise lab.LabError(401, "send Authorization: Bearer <the token from your lab page>")
+        return dict(nick="ada")
+
+    endpoint.setattr(lab, "post", post)
+    with pytest.raises(RuntimeError, match="refused the token"):
+        lab.connect("https://lab.example", "typo")
+    with pytest.raises(RuntimeError, match="not a lab URL"):
+        lab.connect("lab.example", "good")
+    assert lab.LAB.read_text() == saved
+    assert lab.connect(" https://other.example/ ", " good\n") == "ada"
+    assert json.loads(lab.LAB.read_text()) == dict(url="https://other.example", token="good")
+
+
+def test_parallel_map_does_not_wait_for_running_items_after_an_error():
+    release = threading.Event()
+
+    def fn(x):
+        if x == 0:
+            raise ValueError("boom")
+        release.wait(30)  # an agent waiting on the model
+        return x
+
+    start = time.time()
+    try:
+        with pytest.raises(ValueError, match="boom"):
+            lab.parallel_map(fn, [0, 1], threads=2)
+        assert time.time() - start < 5
+    finally:
+        release.set()
+    assert lab.parallel_map(lambda x: 2 * x, [1, 2, 3]) == [2, 4, 6]
+
+
+@pytest.fixture
+def fake_model(monkeypatch):
+    """An OpenAI-compatible server that answers with the scripted messages in turn and keeps the requests."""
+    script, requests = [], []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            body = json.dumps(dict(choices=[dict(index=0, message=script[len(requests) - 1])])).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(lab, "_AGENT", [(f"http://127.0.0.1:{server.server_port}/v1/chat/completions", {}, "fake")])
+    yield script, requests
+    server.shutdown()
+
+
+def test_crm_agent_takes_null_content_and_null_arguments(fake_model):
+    script, requests = fake_model
+    args = dict(query=None, filters=dict(country="Germany", stage="Closed lost"), limit=None, descending=None)
+    script += [dict(role="assistant", content=None, tool_calls=[dict(id="c1", type="function", function=dict(
+                   name="search", arguments=json.dumps(args)))]),
+               dict(role="assistant", content=None, reasoning_content="nothing to add")]
+    out = lab.crm_agent("Which deals did we lose in Germany?", [lab.ATTR_SEARCH], lab.ATTR)
+    assert out == dict(answer="", deals=set(), calls=["search"])
+    result = json.loads(requests[1]["messages"][-1]["content"])
+    assert result["total"] == sum(d["country"] == "Germany" and d["stage"] == "Closed lost" for d in lab.DEALS)
+    assert len(result["deals"]) == min(10, result["total"])
+
+
+def test_crm_agent_shows_the_model_a_wrong_argument_type(fake_model):
+    script, requests = fake_model
+    script += [dict(role="assistant", content=None, tool_calls=[dict(id="c1", type="function", function=dict(
+                   name="search", arguments=json.dumps(dict(filters=["country"]))))]),
+               dict(role="assistant", content="DEALS: none")]
+    assert lab.crm_agent("Deals in Germany?", [lab.ATTR_SEARCH], lab.ATTR)["deals"] == set()
+    assert "AttributeError" in requests[1]["messages"][-1]["content"]

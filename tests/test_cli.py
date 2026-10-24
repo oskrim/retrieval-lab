@@ -1,7 +1,9 @@
 """pytest -p no:xdist tests"""
 
 import pathlib
+import sys
 import textwrap
+import threading
 
 import numpy as np
 import pytest
@@ -29,6 +31,7 @@ def test_check_rows_accepts_k_distinct_ints_in_range():
     ([True, 2, 3], "rows are ints"),
     (["a", "b", "c"], "rows are ints"),
     (None, "return a list or array"),
+    ({1, 2, 3}, "has no order"),
 ])
 def test_check_rows_refuses(rows, why):
     with pytest.raises(cli.ContractError, match=why):
@@ -84,3 +87,100 @@ def test_main_exits_nonzero_without_a_cli_traceback(tmp_path, capsys, monkeypatc
     assert cli.main(["eval", str(path)]) == 1
     out = capsys.readouterr().out
     assert "boom.py:2 in answer" in out and "ValueError: boom" in out and "cli.py" not in out
+
+
+def test_sys_exit_in_the_participants_code_is_their_error(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "HOME", tmp_path)
+    at_import = write(tmp_path, "quits.py", "import sys\nsys.exit('bye')\n")
+    assert cli.main(["eval", str(at_import)]) == 1
+    assert "quits.py raised SystemExit" in capsys.readouterr().out
+    path = write(tmp_path, "exits.py", "import sys\n\ndef answer(question):\n    sys.exit(0)\n")
+    _, module = cli.load_file(str(path))
+    with pytest.raises(cli.UserCodeError) as info:
+        cli.checked_answer(module, path)("q")
+    assert [f.lineno for f in cli.user_frames(info.value.exc, path)] == [4]
+
+
+def test_errors_in_a_helper_module_beside_the_file_show_its_line(tmp_path, capsys):
+    write(tmp_path, "helpers.py", "def rows(k):\n    return list(range(undefined_k))\n")
+    path = write(tmp_path, "mine.py", "from helpers import rows\n\ndef search(ds, question, k=10):\n    return rows(k)\n")
+    _, module = cli.load_file(str(path))
+    with pytest.raises(cli.UserCodeError) as info:
+        cli.checked_search(module, path)(None, "q", 10)
+    cli.show_user_error(info.value)
+    out = capsys.readouterr().out
+    assert "mine.py:4 in search" in out and "helpers.py:2 in rows" in out and "lab.py" not in out
+
+
+def test_eval_history_skips_a_line_cut_short(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "HOME", tmp_path)
+    monkeypatch.setattr(cli, "EVALS", tmp_path / "evals.jsonl")
+    cli.remember(tmp_path / "a.py", "search", "fiqa dev", 0.5, 0.4, 0.6, 500)
+    with open(cli.EVALS, "a") as f:
+        f.write('{"at": 1, "file": "b.py", "kind": "sea')
+    assert cli.best_before("search", "fiqa dev")["score"] == 0.5
+
+
+@pytest.mark.parametrize("label", ["", "   ", "x" * (cli.LABEL_CHARS + 1)])
+def test_submit_refuses_a_bad_label_before_running_anything(tmp_path, capsys, monkeypatch, label):
+    monkeypatch.setattr(cli, "load_file", lambda name: pytest.fail("the file must not run"))
+    assert cli.main(["submit", "search.py", "-m", label]) == 1
+    assert f"1 to {cli.LABEL_CHARS} characters" in capsys.readouterr().out
+
+
+def test_new_says_why_it_cannot_write(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "search.py").symlink_to(tmp_path / "missing" / "x.py")
+    assert cli.main(["new", "search"]) == 1
+    assert "search.py exists" in capsys.readouterr().out
+    locked = tmp_path / "locked"
+    locked.mkdir(mode=0o555)
+    monkeypatch.chdir(locked)
+    assert cli.main(["new", "agent"]) == 1
+    assert "cannot write" in capsys.readouterr().out
+
+
+def test_serve_shows_the_log_when_vllm_exits_while_starting(tmp_path, capsys, monkeypatch):
+    for name, value in (("HOME", tmp_path), ("VENV", tmp_path / "venv"), ("SERVE_LOG", tmp_path / "serve.log"),
+                        ("SERVE_PID", tmp_path / "serve.pid")):
+        monkeypatch.setattr(cli, name, value)
+    monkeypatch.setattr(cli.lab, "local_agent_model", lambda: None)
+    (tmp_path / "venv" / "bin").mkdir(parents=True)
+    vllm = tmp_path / "venv" / "bin" / "vllm"
+    vllm.write_text("#!/bin/sh\necho 'CUDA error: no kernel image'\nexit 1\n")
+    vllm.chmod(0o755)
+    assert cli.main(["serve", "--timeout", "30"]) == 1
+    out = capsys.readouterr().out
+    assert "vLLM stopped while starting" in out and "CUDA error" in out
+    assert not cli.SERVE_PID.exists()
+
+
+def test_ctrl_c_does_not_wait_for_worker_threads(capsys, monkeypatch):
+    release = threading.Event()
+    exits = []
+
+    def run(args):
+        threading.Thread(target=release.wait, args=(30,)).start()  # an agent thread waiting on the model
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "cmd_board", run)
+    monkeypatch.setattr(cli.os, "_exit", exits.append)
+    try:
+        cli.main(["board"])
+    finally:
+        release.set()
+    assert exits == [130] and "stopped" in capsys.readouterr().out
+
+
+def test_model_errors_are_not_blamed_on_the_participant(tmp_path, capsys, monkeypatch):
+    path = write(tmp_path, "agent.py", """\
+        import lab
+
+        def answer(question):
+            raise lab.ModelError("the agent model Qwen/Qwen3.5-9B answered 500: CUDA out of memory")
+    """)
+    monkeypatch.setattr(cli, "require_agent", lambda: None)
+    monkeypatch.setattr(cli, "HOME", tmp_path)
+    assert cli.main(["eval", str(path)]) == 1
+    out = capsys.readouterr().out
+    assert "answered 500: CUDA out of memory" in out and "raised" not in out

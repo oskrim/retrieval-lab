@@ -7,10 +7,10 @@ import importlib.util
 import json
 import os
 import pathlib
-import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.error
@@ -36,6 +36,7 @@ VENV = HOME / "vllm-venv"
 SERVE_LOG, SERVE_PID, EVALS = HOME / "serve.log", HOME / "serve.pid", HOME / "evals.jsonl"
 TEMPLATES = lab.HERE / "templates"
 MIN_FREE_GB = 40
+LABEL_CHARS = 60  # the lab's limit on a submission's label
 EVAL_SETS = (("fiqa", "dev"), ("caiq", "test"))  # caiq has no dev split
 BOARD_DATASET = "fiqa"
 console = Console(theme=Theme({"ok": "green", "err": "bold red", "warn": "yellow", "acc": "cyan", "dim": "grey50",
@@ -83,7 +84,7 @@ def load_file(name: str) -> tuple[pathlib.Path, object]:
     with console.status(f"loading {path.name}"):
         try:
             spec.loader.exec_module(module)
-        except Exception as e:
+        except (Exception, SystemExit) as e:
             raise UserCodeError(e, path) from None
     return path, module
 
@@ -100,18 +101,30 @@ def file_kind(module) -> str:
     raise Fail("the file defines neither search(ds, question, k) nor answer(question)")
 
 
+LAB_FILES = {pathlib.Path(lab.__file__).resolve(), pathlib.Path(__file__).resolve()}
+
+
+def theirs(filename: str, path: pathlib.Path) -> bool:
+    """Whether filename is the participant's code: their file, or a module of theirs beside it (not lab's own)."""
+    if filename.startswith("<"):
+        return False
+    p = pathlib.Path(filename).resolve()
+    return p == path or (p.is_relative_to(path.parent) and p not in LAB_FILES and "site-packages" not in p.parts)
+
+
 def user_frames(exc: BaseException, path: pathlib.Path) -> list[traceback.FrameSummary]:
-    """The traceback frames of exc that are in the participant's file."""
-    if isinstance(exc, SyntaxError) and exc.filename and pathlib.Path(exc.filename).resolve() == path:
-        return [traceback.FrameSummary(exc.filename, exc.lineno or 0, "<module>", line=(exc.text or "").strip())]
-    return [f for f in traceback.extract_tb(exc.__traceback__) if pathlib.Path(f.filename).resolve() == path]
+    """The traceback frames of exc that are in the participant's code, and the line of a syntax error there."""
+    frames = [f for f in traceback.extract_tb(exc.__traceback__) if theirs(f.filename, path)]
+    if isinstance(exc, SyntaxError) and exc.filename and theirs(exc.filename, path):
+        frames.append(traceback.FrameSummary(exc.filename, exc.lineno or 0, "<module>", line=(exc.text or "").strip()))
+    return frames
 
 
 def show_user_error(err: UserCodeError) -> None:
     exc = err.exc
     console.print(f"[err]✗ {err.path.name} raised {type(exc).__name__}[/]")
     for f in user_frames(exc, err.path):
-        console.print(f"  [acc]{err.path.name}:{f.lineno}[/] in {f.name}")
+        console.print(f"  [acc]{pathlib.Path(f.filename).name}:{f.lineno}[/] in {f.name}")
         if f.line:
             console.print(Syntax(f.line, "python", theme="ansi_dark", background_color="default", padding=(0, 0, 0, 4)))
     console.print(f"  {type(exc).__name__}: {exc}", markup=False)
@@ -119,6 +132,8 @@ def show_user_error(err: UserCodeError) -> None:
 
 def check_rows(rows, n_docs: int, k: int) -> list[int]:
     """search's contract: k distinct document rows (ints in range), best first."""
+    if isinstance(rows, (set, frozenset)):
+        raise ContractError(f"search returned a set, which has no order; return a list or array of {k} rows, best first")
     try:
         items = list(rows)
     except TypeError:
@@ -151,9 +166,9 @@ def checked_search(module, path: pathlib.Path):
     def run(ds: lab.Dataset, question: str, k: int = 10) -> list[int]:
         try:
             rows = module.search(ds, question, k=k)
-        except lab.LabError:
+        except (lab.LabError, lab.ModelError):
             raise
-        except Exception as e:
+        except (Exception, SystemExit) as e:
             raise UserCodeError(e, path) from None
         try:
             return check_rows(rows, len(ds.ids), k)
@@ -166,9 +181,9 @@ def checked_answer(module, path: pathlib.Path):
     def run(question: str) -> set[str]:
         try:
             found = module.answer(question)
-        except lab.LabError:
+        except (lab.LabError, lab.ModelError):
             raise
-        except Exception as e:
+        except (Exception, SystemExit) as e:
             raise UserCodeError(e, path) from None
         try:
             return check_deals(found)
@@ -179,10 +194,21 @@ def checked_answer(module, path: pathlib.Path):
 
 # ---- eval history
 
-def best_before(kind: str, dataset: str) -> dict | None:
+def history() -> list[dict]:
+    """The earlier evals; a line cut short (a full disk, an interrupted write) is skipped."""
     if not EVALS.exists():
-        return None
-    rows = [r for r in map(json.loads, EVALS.read_text().splitlines()) if r["kind"] == kind and r["dataset"] == dataset]
+        return []
+    rows = []
+    for line in EVALS.read_text().splitlines():
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+    return rows
+
+
+def best_before(kind: str, dataset: str) -> dict | None:
+    rows = [r for r in history() if r.get("kind") == kind and r.get("dataset") == dataset]
     return max(rows, key=lambda r: r["score"], default=None)
 
 
@@ -267,16 +293,16 @@ def eval_agent(path: pathlib.Path, module, worst: int) -> None:
     answer = checked_answer(module, path)
     questions = lab.crm_dev()
     found: dict[int, set[str]] = {}
-    with progress(MofNCompleteColumn()) as bar, ThreadPoolExecutor(8) as pool:
-        task = bar.add_task("crm dev", total=len(questions))
-        futures = {pool.submit(answer, q): i for i, (q, _) in enumerate(questions)}
-        try:
+    pool = ThreadPoolExecutor(8)
+    try:
+        with progress(MofNCompleteColumn()) as bar:
+            task = bar.add_task("crm dev", total=len(questions))
+            futures = {pool.submit(answer, q): i for i, (q, _) in enumerate(questions)}
             for f in as_completed(futures):
                 found[futures[f]] = f.result()
                 bar.advance(task)
-        except BaseException:
-            pool.shutdown(cancel_futures=True)
-            raise
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)  # an error or Ctrl-C does not wait for the running agents
     exact = np.array([found[i] == gold for i, (_, gold) in enumerate(questions)], dtype=float)
     lo, hi = lab.bootstrap(exact)
     for (q, _), e in zip(questions, exact):
@@ -303,6 +329,9 @@ def cmd_eval(args) -> None:
 # ---- submit
 
 def cmd_submit(args) -> None:
+    label = args.m.strip()
+    if not 1 <= len(label) <= LABEL_CHARS:
+        raise Fail(f"-m: a label of 1 to {LABEL_CHARS} characters on what your file does (yours has {len(label)})")
     path, module = load_file(args.file)
     kind = file_kind(module)
     with progress(TextColumn("{task.completed} questions")) as bar:
@@ -311,13 +340,13 @@ def cmd_submit(args) -> None:
             ds, search = lab.load(BOARD_DATASET), checked_search(module, path)
             search(ds, ds.queries[ds.qids[0]], k=10)
             bar.update(task, description="running on the board's questions")
-            result = lab.submit(ds, lambda ds_, question, k=10: counted(bar, task, search(ds_, question, k)), args.m)
+            result = lab.submit(ds, lambda ds_, question, k=10: counted(bar, task, search(ds_, question, k)), label)
         else:
             require_agent()
             answer = checked_answer(module, path)
             answer(lab.CRM_QUESTIONS[0][0])
             bar.update(task, description="running on the board's questions")
-            result = lab.submit_agent(lambda question: counted(bar, task, answer(question)), args.m)
+            result = lab.submit_agent(lambda question: counted(bar, task, answer(question)), label)
     rank = f" · rank [num]{result['rank']}[/] of {result['of']}" if "rank" in result and "of" in result else ""
     ok(f"submitted {path.name} · score [num]{result['score']:.4f}[/] · your best {result['best']:.4f}{rank}")
 
@@ -490,6 +519,7 @@ def cmd_serve(args) -> None:
             raise Fail(f"{lab.VLLM_URL} serves {model}, not {lab.AGENT_MODEL}; stop that server, then run lab serve")
         ok(f"vLLM is already up · {model}")
         return
+    proc = None
     if serve_pid() is None:
         binary = VENV / "bin" / "vllm"
         if not binary.exists():
@@ -506,7 +536,7 @@ def cmd_serve(args) -> None:
     try:
         with console.status("") as status:
             while lab.local_agent_model() is None:
-                if serve_pid() is None:
+                if not starting(proc):
                     SERVE_PID.unlink(missing_ok=True)
                     console.print(Panel(Text(tail(SERVE_LOG), style="dim"), title="serve.log", title_align="left",
                                         border_style="err"))
@@ -521,6 +551,12 @@ def cmd_serve(args) -> None:
         console.print("[dim]vLLM keeps starting in the background; lab status shows when it is up[/]")
         return
     ok(f"vLLM is up · {lab.AGENT_MODEL} at {lab.VLLM_URL} · log {SERVE_LOG}")
+
+
+def starting(proc: subprocess.Popen | None) -> bool:
+    """Whether vLLM still runs: proc when this command started it (a child that exited stays a zombie, which
+    os.kill still finds), else the process in SERVE_PID."""
+    return proc.poll() is None if proc is not None else serve_pid() is not None
 
 
 def stop_vllm() -> None:
@@ -557,8 +593,10 @@ def cmd_status(args) -> None:
             nick = lab.call("/api/me")["nick"] if lab.LAB.exists() else None
             conn = f"[ok]connected[/] as [num]{nick}[/] · {json.loads(lab.LAB.read_text())['url']}" if nick else \
                 "[warn]not connected[/] · lab connect URL TOKEN"
-        except (lab.LabError, OSError) as e:
+        except lab.LabError as e:
             conn = f"[err]refused[/] · {e}"
+        except OSError as e:
+            conn = f"[err]unreachable[/] · {getattr(e, 'reason', e)}"
         needed = [("encoder", lab.QUERY_MODEL, lab.QUERY_REVISION)] + (
             [("reranker", lab.RERANK_MODEL, None), ("agent", lab.AGENT_MODEL, None)] if found else [])
         models = " · ".join(f"{what} {'[ok]✓[/]' if cached(repo, rev) else '[err]✗[/]'}" for what, repo, rev in needed)
@@ -586,9 +624,13 @@ def cmd_connect(args) -> None:
 
 def cmd_new(args) -> None:
     target = pathlib.Path.cwd() / f"{args.kind}.py"
-    if target.exists():
-        raise Fail(f"{target.name} exists; rename or remove it first")
-    shutil.copyfile(TEMPLATES / f"{args.kind}.py", target)
+    try:
+        with open(target, "x") as f:
+            f.write((TEMPLATES / f"{args.kind}.py").read_text())
+    except FileExistsError:
+        raise Fail(f"{target.name} exists; rename or remove it first") from None
+    except OSError as e:
+        raise Fail(f"cannot write {target}: {e.strerror}; run lab new in a directory of yours") from None
     ok(f"wrote {target.name} · next: lab eval {target.name}")
 
 
@@ -643,8 +685,14 @@ def main(argv: list[str] | None = None) -> int:
         fail(f"cannot reach the lab: {e.reason}")
     except RuntimeError as e:  # lab's own messages: not connected, the agent model is down
         fail(str(e))
+    except OSError as e:  # the CLI's own files: an unwritable directory, a full disk
+        fail(str(e))
     except KeyboardInterrupt:
         console.print("[dim]stopped[/]")
+        if threading.active_count() > 1:  # agent threads can wait minutes on the model; exit without joining them
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(130)
         return 130
     return 1
 
