@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- One Vespa node: a container that answers queries and takes the feed, and a content cluster that holds both datasets. -->
+<services version="1.0">
+  <container id="default" version="1.0">
+    <search/>
+    <document-api/>
+  </container>
+  <content id="content" version="1.0">
+    <redundancy>1</redundancy>
+    <documents>
+      <document type="fiqa" mode="index"/>
+      <document type="caiq" mode="index"/>
+    </documents>
+  </content>
+</services>

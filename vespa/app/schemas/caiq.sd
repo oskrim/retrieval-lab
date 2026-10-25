@@ -1,0 +1,201 @@
+# A dataset's documents and the ways to rank them, one rank profile per notebook section. fiqa.sd and caiq.sd differ
+# only in the name; keep the two in step. After an edit: lab vespa deploy (it says when a refeed is needed).
+schema caiq {
+
+  document caiq {
+    field id type string {
+      indexing: attribute | summary
+      attribute: fast-search
+    }
+    field title type string {
+      indexing: index | summary
+      index: enable-bm25
+    }
+    field body type string {
+      indexing: index | summary
+      index: enable-bm25
+    }
+    # The pplx document vectors (lab.vectors) three ways: float, int8 (round(512 · value)), and the centered sign bits
+    # of lab.dense_parts packed 8 to an int8 cell. Without an index, nearestNeighbor compares every document (exact).
+    field dense_float type tensor<float>(x[1024]) {
+      indexing: attribute
+      attribute {
+        distance-metric: dotproduct
+      }
+      # attribute: paged  # on disk, read through the OS page cache: less memory, slower while the cache is cold
+    }
+    field dense_int8 type tensor<int8>(x[1024]) {
+      indexing: attribute
+      attribute {
+        distance-metric: dotproduct
+      }
+    }
+    field dense_bits type tensor<int8>(x[128]) {
+      indexing: attribute
+      attribute {
+        distance-metric: hamming
+      }
+    }
+    # pplx v2-late token vectors (lab.late_tokens), t numbering a document's tokens: as int8 with one scale per token
+    # (the vector is late_int8 · late_scale), and as centered sign bits, 16 int8 cells per token (an eighth of the size)
+    field late_int8 type tensor<int8>(t{}, x[128]) {
+      indexing: attribute
+    }
+    field late_scale type tensor<float>(t{}) {
+      indexing: attribute
+    }
+    field late_bits type tensor<int8>(t{}, x[16]) {
+      indexing: attribute
+    }
+  }
+
+  # The title and body again, for the question's word pairs only (search.py sends them as phrases); matchCount of
+  # these fields is how many of the pairs a document contains.
+  field title_pairs type string {
+    indexing: input title | index
+  }
+  field body_pairs type string {
+    indexing: input body | index
+  }
+
+  fieldset default {
+    fields: title, body
+  }
+
+  document-summary ids {
+    summary id {}
+  }
+
+  # The inputs and functions the profiles below share. search.py sends every query(...) input; the numbers are defaults.
+  rank-profile common {
+    inputs {
+      query(q) tensor<float>(x[1024])
+      query(qc) tensor<float>(x[1024])
+      query(qbits) tensor<int8>(x[128])
+      query(qlate) tensor<int8>(qt{}, x[16])
+      query(qlate_float) tensor<float>(qt{}, x[128])
+      query(title_weight): 1.0
+      query(body_weight): 1.0
+      query(saturation): 25.0
+      query(pairs): 0.0
+      query(phrase_weight): 0.2
+      query(bm25_weight): 1.0
+      query(dense_weight): 4.0
+      query(late_weight): 0.5
+    }
+    # notebook 11: BM25 / (S + BM25), so a field's score levels off
+    function saturated(x) {
+      expression: x / (query(saturation) + x)
+    }
+    # notebook 12: the share of the question's word pairs that occur as phrases, body counting half
+    function phrase_share() {
+      expression: (0.5 * matchCount(body_pairs) + matchCount(title_pairs)) / max(1, query(pairs))
+    }
+    function lexical() {
+      expression: saturated(bm25(body)) + saturated(bm25(title)) + query(phrase_weight) * phrase_share
+    }
+    # notebook 14: cosine of the unit vectors
+    function cosine() {
+      expression: sum(query(q) * attribute(dense_float))
+    }
+    # notebook 15: the float question (centered, qc) against the document's bits as ±1, over sqrt(1024)
+    function dense() {
+      expression: (2 * sum(query(qc) * unpack_bits(attribute(dense_bits))) - sum(query(qc))) / 32
+    }
+    # notebook 16: per question token, its best match among the document's tokens, summed: the dot product with the
+    # int8 vectors, or 128 - 2 · differing bits (the dot product of the vectors' signs as ±1)
+    function late_int8() {
+      expression: reduce(reduce(reduce(query(qlate_float) * attribute(late_int8), sum, x) * attribute(late_scale), max, t), sum, qt)
+    }
+    function late() {
+      expression: reduce(reduce(128 - 2 * reduce(hamming(query(qlate), attribute(late_bits)), sum, x), max, t), sum, qt)
+    }
+  }
+
+  # notebook 7
+  rank-profile bm25-body inherits common {
+    first-phase {
+      expression: bm25(body)
+    }
+  }
+
+  # notebook 9: one BM25 per field, weighted by query(title_weight) and query(body_weight)
+  rank-profile bm25-fields inherits common {
+    first-phase {
+      expression: query(body_weight) * bm25(body) + query(title_weight) * bm25(title)
+    }
+  }
+
+  # notebooks 11-12: saturated BM25 per field plus phrase matches. Vespa's own proximity features, such as
+  # nativeProximity(body) or fieldMatch(body).proximity, are other ways to reward words that occur close together.
+  rank-profile phrase inherits common {
+    first-phase {
+      expression: lexical
+    }
+    match-features: bm25(body) bm25(title) matchCount(body_pairs) matchCount(title_pairs)
+  }
+
+  # notebook 14: query with {targetHits:100}nearestNeighbor(dense_float, q)
+  rank-profile dense-float inherits common {
+    first-phase {
+      expression: cosine
+    }
+  }
+
+  # int8 vectors: a quarter of float's memory; query with nearestNeighbor(dense_int8, q)
+  rank-profile dense-int8 inherits common {
+    first-phase {
+      expression: sum(query(q) * attribute(dense_int8))
+    }
+  }
+
+  # notebook 15: the hamming distance of the bits finds candidates (nearestNeighbor(dense_bits, qbits)), then the
+  # float vectors rescore the best 100. dense, the float question against the bits, rescores without float vectors.
+  rank-profile dense-binary inherits common {
+    first-phase {
+      expression: closeness(field, dense_bits)
+    }
+    second-phase {
+      rerank-count: 100
+      expression: cosine
+    }
+  }
+
+  # The notebook's search before reranking (lab.hybrid): query with userInput(@q) or nearestNeighbor(dense_bits, qbits)
+  rank-profile hybrid inherits common {
+    first-phase {
+      expression: query(bm25_weight) * lexical + query(dense_weight) * max(0, dense)
+    }
+    match-features: bm25(body) bm25(title) phrase_share dense cosine
+  }
+
+  # notebook 16: the hybrid's best 20, reordered by the hybrid and the late-interaction score together. The second
+  # phase computes the late score on the content node, where the token vectors are; the global phase, in the
+  # container, only combines the two scores.
+  rank-profile maxsim inherits hybrid {
+    second-phase {
+      rerank-count: 20
+      expression: late
+    }
+    global-phase {
+      rerank-count: 20
+      expression: normalize_linear(firstPhase) + query(late_weight) * normalize_linear(secondPhase)
+    }
+  }
+
+  rank-profile maxsim-int8 inherits maxsim {
+    second-phase {
+      rerank-count: 20
+      expression: late_int8
+    }
+  }
+
+  # notebook 13: a LightGBM model reorders the hybrid's best 100 in the container, from the hybrid's match-features.
+  # tools/vespa_ltr.py trains it on the fiqa test questions; add features there and to match-features to try more.
+  rank-profile ltr inherits hybrid {
+    global-phase {
+      rerank-count: 100
+      expression: lightgbm("ltr.json")
+    }
+  }
+}
