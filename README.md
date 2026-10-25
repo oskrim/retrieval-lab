@@ -37,6 +37,23 @@ lab board agent
 
 `lab status` shows the GPU, the agent model, your connection and the downloads; `lab serve --stop` stops the model.
 
+## Your own Vespa
+
+The search can also run on your own [Vespa](https://vespa.ai), in Docker on the same machine; Vespa needs no GPU.
+`vespa/app` holds the schemas, with one rank profile per notebook section, and `vespa/search.py` queries them.
+
+```bash
+lab new vespa                 # vespa/search.py and vespa/NICK (and vespa/app outside this repo)
+lab vespa up                  # starts Vespa, deploys vespa/app, feeds the data (once; about 3 minutes)
+lab eval vespa/search.py
+lab vespa deploy              # after an edit of vespa/app/schemas/fiqa.sd and caiq.sd (keep the two the same)
+lab vespa status              # memory, documents, and whether a schema change needs lab vespa up to feed again
+lab vespa down                # removes the container and its data
+```
+
+Docker must run without sudo: on Ubuntu, `sudo apt install docker.io && sudo usermod -aG docker $USER`, then log in
+again. To hand in, put your lab nick in `vespa/NICK`, commit `vespa/` and push the branch to your fork.
+
 ## No GPU
 
 The lab also runs on a laptop, with less: the reranker's scores come from a precomputed cache (a pair outside it ranks
