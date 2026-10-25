@@ -1,5 +1,5 @@
-# A dataset's documents and the ways to rank them, one rank profile per notebook section. fiqa.sd and caiq.sd differ
-# only in the name; keep the two in step. After an edit: lab vespa deploy (it says when a refeed is needed).
+# The schema of every dataset, with one rank profile per notebook section: each deploy makes caiq.sd from this file,
+# renaming only the schema and the document. After an edit: lab vespa deploy (it says when a refeed is needed).
 schema fiqa {
 
   document fiqa {

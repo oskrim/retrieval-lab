@@ -871,14 +871,13 @@ def vespa_up(app: str | None) -> None:
 def vespa_deploy(app: str | None) -> None:
     path = labvespa.app_dir(app)
     with console.status("deploying") as status:
-        answer = labvespa.deploy(path, lambda m: status.update(m))
+        answer = labvespa.deploy(path, lambda m: status.update(m), warn)
     show_changes(answer)
-    done = labvespa.fed()
-    stale = [n for n in labvespa.DATASETS if done.get(n) != labvespa.fingerprint(path, n)]
     ok(f"deployed {path}")
-    if stale:
-        console.print(f"[warn]![/] the document fields of {' and '.join(stale)} changed since the feed: "
-                      f"lab vespa up {app or ''}".rstrip() + " feeds them again")
+    unfed = labvespa.unfed()
+    if unfed:
+        warn(f"{' and '.join(unfed)}: {'; '.join(sorted(set(unfed.values())))}; lab vespa up {app or ''}".rstrip()
+             + " feeds them (about 1.5 minutes)")
 
 
 def show_changes(answer: dict) -> None:
@@ -911,11 +910,9 @@ def vespa_status(app: str | None) -> None:
     if s["state"] == "running":
         grid.add_row("memory", s["memory"])
         grid.add_row("queries", f"{s['query']} · " + ("[ok]serving[/]" if s["serving"] else "[warn]not serving[/] · lab vespa up"))
-        path = labvespa.app_dir(None)
         for name, d in s["datasets"].items():
-            current = d["fed"] == labvespa.fingerprint(path, name)
             grid.add_row(name, f"{d['documents'] if d['documents'] is not None else '–'} documents · " + (
-                "[ok]fed[/]" if current else "[warn]not fed for these fields[/] · lab vespa up"))
+                f"[warn]{d['problem']}[/] · lab vespa up" if d["problem"] else "[ok]fed[/]"))
     console.print(Panel(grid, title="lab vespa status", title_align="left", border_style="acc", expand=False))
 
 

@@ -27,12 +27,14 @@ NAME = "lab-vespa"
 QUERY_PORT, CONFIG_PORT = 18080, 19071  # on 127.0.0.1: queries and feed, and the config server (deploy)
 LIMITS = ("--memory", "16g", "--cpus", "6")  # the container's share of the machine
 DATASETS = ("fiqa", "caiq")
+SOURCE = "fiqa"  # vespa/app/schemas/fiqa.sd is every dataset's schema; a deploy makes the others from it
 APP = lab.HERE / "vespa" / "app"
 MARKER = "/opt/vespa/var/lab-fed.json"  # inside the container: what was fed, so a second up skips the feed
 FEED_FORMAT = 1  # part of the marker; bump it when what the feed writes changes
 INT8_SCALE = 512  # dense_int8 = round(512 · unit vector); the largest value in the data is 0.22, so 111
 ILLEGAL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]")  # code points a Vespa string field refuses
 QUERY_URL, CONFIG_URL = f"http://127.0.0.1:{QUERY_PORT}", f"http://127.0.0.1:{CONFIG_PORT}"
+APPLICATION_URL = f"{CONFIG_URL}/application/v2/tenant/default/application/default/environment/prod/region/default/instance/default"
 
 
 class VespaError(RuntimeError):
@@ -106,12 +108,20 @@ def app_dir(app: str | pathlib.Path | None) -> pathlib.Path:
     return path.resolve()
 
 
-def zipped(app: pathlib.Path) -> bytes:
+def package(app: pathlib.Path, warn=print) -> bytes:
+    """app as a zip for the config server, with every dataset's schema made from fiqa.sd (schema)."""
     out = io.BytesIO()
+    made = {f"schemas/{name}.sd" for name in DATASETS if name != SOURCE}
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         for f in sorted(app.rglob("*")):
-            if f.is_file() and not f.name.startswith("."):
-                z.write(f, f.relative_to(app))
+            rel = f.relative_to(app).as_posix()
+            if rel in made:
+                warn(f"{f} is not used: every deploy makes {f.name} from {SOURCE}.sd; edit {SOURCE}.sd only")
+            elif f.is_file() and not f.name.startswith("."):
+                z.write(f, rel)
+        for name in DATASETS:
+            if name != SOURCE:
+                z.writestr(f"schemas/{name}.sd", schema(app, name))
     return out.getvalue()
 
 
@@ -134,15 +144,22 @@ def fields(sd: str, name: str) -> dict[str, str]:
 
 
 def schema(app: pathlib.Path, name: str) -> str:
-    path = app / "schemas" / f"{name}.sd"
+    """Dataset name's schema: fiqa.sd, for another dataset with only the schema and document renamed."""
+    path = app / "schemas" / f"{SOURCE}.sd"
     if not path.is_file():
-        raise VespaError(f"{path} is missing; the lab feeds {' and '.join(DATASETS)}")
-    return path.read_text()
+        raise VespaError(f"{path} is missing: it is the schema of every dataset ({', '.join(DATASETS)})")
+    text = path.read_text()
+    if name == SOURCE:
+        return text
+    renamed, n = re.subn(rf"^(\s*(?:schema|document)\s+){SOURCE}\b", rf"\g<1>{name}", text, flags=re.M)
+    if n != 2:
+        raise VespaError(f"{path} must start one line with 'schema {SOURCE}' and one with 'document {SOURCE}'")
+    return renamed
 
 
-def fingerprint(app: pathlib.Path, name: str) -> str:
-    """What a feed of dataset name depends on: the data, the feed's format and the schema's document fields."""
-    key = f"{lab.DATA_VERSION} {FEED_FORMAT} {document_block(schema(app, name), name)}"
+def fingerprint(sd: str, name: str) -> str:
+    """What a feed of dataset name depends on: the data, the feed's format and schema sd's document fields."""
+    key = f"{lab.DATA_VERSION} {FEED_FORMAT} {document_block(sd, name)}"
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
@@ -239,7 +256,7 @@ def start(progress=None) -> None:
          180, progress)
 
 
-def deploy(app: str | pathlib.Path | None = None, progress=None) -> dict:
+def deploy(app: str | pathlib.Path | None = None, progress=None, warn=print) -> dict:
     """Deploys app (default: ./vespa/app, else the repo's) and waits until Vespa serves it. Returns Vespa's answer:
     warnings under "log", and under "configChangeActions" what needs a restart, refeed or reindex."""
     path = app_dir(app)
@@ -247,19 +264,48 @@ def deploy(app: str | pathlib.Path | None = None, progress=None) -> dict:
         raise VespaError("Vespa is not running; lab vespa up starts it")
     for name in DATASETS:
         document_block(schema(path, name), name)
+    zipped = package(path, warn)
     if progress:
         progress(f"deploying {path}")
     try:
-        status, answer = http("POST", f"{CONFIG_URL}/application/v2/tenant/default/prepareandactivate", zipped(path),
+        status, answer = http("POST", f"{CONFIG_URL}/application/v2/tenant/default/prepareandactivate", zipped,
                               "application/zip", timeout=300)
     except OSError as e:
         raise VespaError(f"cannot reach the config server at {CONFIG_URL}: {e}; lab vespa up starts it") from None
     if status != 200:
-        raise VespaError(f"Vespa refused {path}:\n{answer.get('message', answer)}")
-    converge = f"{CONFIG_URL}/application/v2/tenant/default/application/default/environment/prod/region/default/instance/default/serviceconverge"
-    wait("the new application", lambda: (reachable(converge) or {}).get("converged") is True, 300, progress)
+        raise VespaError(f"Vespa refused {path}: {brief_deploy_error(str(answer.get('message', answer)))}")
+    wait("the new application", lambda: (reachable(f"{APPLICATION_URL}/serviceconverge") or {}).get("converged") is True,
+         300, progress)
     wait("the query endpoint", ready, 300, progress)
     return answer
+
+
+LONG_VALUE = re.compile(r"'[^']{60,}'|\[[^\]]{60,}\]|\{[^}]{60,}\}")  # a tensor or list Vespa echoes back
+MAX_LINE = 300
+
+
+def cut(text: str) -> str:
+    """text with every long quoted value, list or tensor cut to its first 30 characters."""
+    return LONG_VALUE.sub(lambda m: f"{m.group(0)[:30]}…{m.group(0)[-1]}", text)
+
+
+def brief_deploy_error(message: str, lines: int = 8) -> str:
+    """Vespa's refusal of an application, its cause first: the first warning (the rank feature or setting that failed),
+    then the other lines that are not INFO, each once, at most lines lines."""
+    rows = [cut(r.strip())[:MAX_LINE] for r in message.splitlines() if r.strip() and not r.strip().startswith("INFO:")]
+    first = next((r for r in rows if r.startswith("WARNING:")), rows[0] if rows else "no reason given")
+    out = [first.removeprefix("WARNING: ")]
+    for r in rows:
+        if r != first and r not in out and len(out) < lines:
+            out.append(r)
+    return "\n  ".join(out)
+
+
+def brief_query_error(error: dict) -> str:
+    """One of Vespa's query errors, its root cause (the last part of a "a: b: cause" chain) first, values cut short."""
+    text = cut(" ".join(str(error.get(k, "")) for k in ("summary", "message")).strip())
+    cause = text.rsplit(": ", 1)[-1]
+    return f"Vespa: {cause}" + (f"\n  {text[:MAX_LINE]}" if cause != text else "")
 
 
 def ready() -> bool:
@@ -290,6 +336,30 @@ def fed() -> dict[str, str]:
         return json.loads(docker("exec", NAME, "sh", "-c", f"cat {MARKER} 2>/dev/null || echo '{{}}'"))
     except ValueError:
         return {}
+
+
+def deployed(name: str) -> str | None:
+    """The schema of dataset name in the application Vespa runs now, or None without one."""
+    try:
+        with urllib.request.urlopen(f"{APPLICATION_URL}/content/schemas/{name}.sd", timeout=10) as r:
+            return r.read().decode()
+    except OSError:  # no application yet, or no config server
+        return None
+
+
+def unfed() -> dict[str, str]:
+    """dataset -> why its documents do not hold what the deployed schema declares (not fed yet, or fed for other
+    document fields); the datasets that are fine are left out."""
+    done, out = fed(), {}
+    for name in DATASETS:
+        sd = deployed(name)
+        if sd is None:
+            out[name] = "no application is deployed"
+        elif name not in done:
+            out[name] = "not fed yet"
+        elif done[name] != fingerprint(sd, name):
+            out[name] = "fed for other document fields than the deployed schema's"
+    return out
 
 
 def feed(name: str, app: pathlib.Path, advance=None, warn=print) -> float:
@@ -335,14 +405,16 @@ def up(app: str | pathlib.Path | None = None, progress=None, feeding=None, warn=
     if not (lab.DATA / lab.DATA_VERSION).is_dir():
         raise VespaError("the lab's data is not here yet; run lab setup first")
     start(progress)
-    answer = deploy(path, progress)
+    answer = deploy(path, progress, warn)
     done, seconds = fed(), {}
     for name in DATASETS:
-        if done.get(name) == fingerprint(path, name):
+        if done.get(name) == fingerprint(schema(path, name), name):
             continue
+        done.pop(name, None)  # an interrupted feed leaves the dataset unfed, not fed for its old fields
+        docker("exec", "-i", NAME, "sh", "-c", f"cat > {MARKER}", stdin=json.dumps(done))
         advance = feeding(name, len(lab.load(name).ids)) if feeding else None
         seconds[name] = feed(name, path, advance, warn)
-        done[name] = fingerprint(path, name)
+        done[name] = fingerprint(schema(path, name), name)
         docker("exec", "-i", NAME, "sh", "-c", f"cat > {MARKER}", stdin=json.dumps(done))
     return dict(deploy=answer, fed=seconds)
 
@@ -356,14 +428,15 @@ def down() -> bool:
 
 
 def status() -> dict:
-    """The container's state, memory, and per dataset its document count and whether its feed is current."""
+    """The container's state, memory, and per dataset its document count and why its feed is not current (None when
+    it is)."""
     s = state()
     out: dict = dict(state=s, image=IMAGE, query=QUERY_URL, config=CONFIG_URL)
     if s != "running":
         return out
     out["memory"] = docker("stats", "--no-stream", "--format", "{{.MemUsage}}", NAME).strip()
     out["serving"] = ready()
-    marks, out["datasets"] = fed(), {}
+    problems, out["datasets"] = unfed(), {}
     for name in DATASETS:
         count = None
         if out["serving"]:
@@ -373,7 +446,7 @@ def status() -> dict:
                 count = data.get("root", {}).get("fields", {}).get("totalCount")
             except OSError:
                 pass
-        out["datasets"][name] = dict(documents=count, fed=marks.get(name))
+        out["datasets"][name] = dict(documents=count, problem=problems.get(name))
     return out
 
 
@@ -405,11 +478,26 @@ def late_inputs(ds: lab.Dataset, question: str) -> dict:
             "query(qlate_float)": {"blocks": {str(t): v.tolist() for t, v in enumerate(vectors)}}}
 
 
+_FED_CHECKED: set[str] = set()  # the datasets this process found fed for the deployed schema
+
+
+def require_fed(ds_name: str) -> None:
+    """Fails unless dataset ds_name's documents hold the deployed schema's fields, so no search scores on a stale or
+    half-done feed; checked once per process."""
+    if ds_name in _FED_CHECKED:
+        return
+    problem = unfed().get(ds_name)
+    if problem:
+        raise VespaError(f"{ds_name} is {problem}: run lab vespa up to feed it (about 1.5 minutes)")
+    _FED_CHECKED.add(ds_name)
+
+
 def query(ds_name: str, yql: str, ranking: str, inputs: dict | None = None, hits: int = 10,
           **params) -> list[tuple[str, float]]:
     """Runs yql on dataset ds_name with rank profile ranking; (doc id, relevance) of the best hits, best first.
     inputs: the rank profile's query(...) inputs, as numbers or lists (numpy arrays are converted); params: other
-    request parameters, such as q for userInput(@q)."""
+    request parameters, such as q for userInput(@q). Fails while ds_name's feed does not match the deployed schema."""
+    require_fed(ds_name)
     body = {"yql": yql, "ranking": ranking, "hits": hits, "model.restrict": ds_name, "presentation.summary": "ids",
             "timeout": "10s", **params}
     for k, v in (inputs or {}).items():
@@ -420,6 +508,5 @@ def query(ds_name: str, yql: str, ranking: str, inputs: dict | None = None, hits
         raise VespaError(f"Vespa does not answer at {QUERY_URL} ({getattr(e, 'reason', e)}); lab vespa up starts it") from None
     errors = data.get("root", {}).get("errors") or ([data] if status != 200 else [])
     if errors:
-        e = errors[0]
-        raise VespaError(f"Vespa: {e.get('summary', '')} {e.get('message', e)}".strip())
+        raise VespaError(brief_query_error(errors[0]))
     return [(h["fields"]["id"], h["relevance"]) for h in data["root"].get("children", [])]

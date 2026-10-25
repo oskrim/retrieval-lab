@@ -1,7 +1,7 @@
-"""Your search on your own Vespa: the notebook's ranking as rank profiles in vespa/app/schemas/*.sd.
+"""Your search on your own Vespa: the notebook's ranking as rank profiles in vespa/app/schemas/fiqa.sd.
 
   lab vespa up                             start Vespa, deploy vespa/app and feed the data (the feed runs once)
-  lab vespa deploy                         after editing vespa/app (fiqa.sd and caiq.sd: keep them the same)
+  lab vespa deploy                         after editing vespa/app/schemas/fiqa.sd (caiq.sd is made from it)
   lab eval vespa/search.py                 nDCG@10 on the dev questions
   lab submit vespa/search.py -m "what changed"
 
