@@ -109,7 +109,9 @@ def test_a_search_on_a_feed_that_does_not_match_the_deployed_schema_fails(monkey
     monkeypatch.setattr(labvespa, "_FED_CHECKED", set())
     monkeypatch.setattr(labvespa, "deployed", lambda name: SD.replace("fiqa", name))
     monkeypatch.setattr(labvespa, "fed", lambda: {"fiqa": labvespa.fingerprint(SD.replace("bfloat16", "float"), "fiqa")})
-    assert labvespa.unfed() == {"fiqa": "fed for other document fields than the deployed schema's", "caiq": "not fed yet"}
+    monkeypatch.setattr(labvespa, "state", lambda: "running")
+    assert labvespa.unfed() == {"fiqa": "fed for other document fields than the deployed schema's",
+                                "caiq": "not fed, or its last feed did not finish"}
     monkeypatch.setattr(labvespa, "http", lambda *a, **k: pytest.fail("no query on a stale feed"))
     with pytest.raises(labvespa.VespaError, match="^fiqa is fed for other document fields .*run lab vespa up"):
         labvespa.query("fiqa", "select * from fiqa where true", "hybrid")
@@ -127,3 +129,34 @@ def test_the_feed_writes_the_declared_fields_and_warns_of_the_rest(monkeypatch):
     assert docs[0] == {"put": "id:caiq:caiq::a", "fields": {"id": "a", "title": "T ", "dense_int8": {"values": "339a"}}}
     with pytest.raises(labvespa.VespaError, match="dense_int8 needs int8 cells"):
         labvespa.documents("caiq", {"dense_int8": "tensor<float>(x[2])"}, warned.append)
+
+
+@pytest.mark.parametrize("stderr, hint", [
+    ("docker: Error response from daemon: Bind for 127.0.0.1:18080 failed: port is already allocated\n\n"
+     "Run 'docker run --help' for more information\n", "Bind for 127.0.0.1:18080 failed: port is already allocated; Vespa needs ports"),
+    ("permission denied while trying to connect to the Docker daemon socket", "sudo usermod -aG docker"),
+    ("Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
+     "sudo systemctl start docker"),
+])
+def test_docker_failures_say_what_to_do(stderr, hint, monkeypatch):
+    monkeypatch.setattr(labvespa.subprocess, "run", lambda *a, **k: labvespa.subprocess.CompletedProcess(a, 125, "", stderr))
+    with pytest.raises(labvespa.VespaError, match="^docker run failed: ") as e:
+        labvespa.docker("run", "x")
+    assert hint in str(e.value) and "--help" not in str(e.value)
+
+
+def test_start_replaces_a_container_that_never_started(monkeypatch):
+    calls, states = [], iter(["created", "running"])
+    monkeypatch.setattr(labvespa, "state", lambda: next(states))
+    monkeypatch.setattr(labvespa, "docker", lambda *a, **k: calls.append(a[0]) or "")
+    monkeypatch.setattr(labvespa, "reachable", lambda url: {"status": {"code": "up"}})
+    labvespa.start()
+    assert calls == ["rm", "run"]
+
+
+def test_a_container_that_stops_while_starting_fails_at_once(monkeypatch):
+    monkeypatch.setattr(labvespa, "state", lambda: "exited")
+    logs = "info: starting\npanic: this host [localhost] should not run a config server\n"
+    monkeypatch.setattr(labvespa.subprocess, "run", lambda *a, **k: labvespa.subprocess.CompletedProcess(a, 0, logs, ""))
+    with pytest.raises(labvespa.VespaError, match="stopped while starting: panic: this host"):
+        labvespa.alive()

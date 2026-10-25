@@ -52,8 +52,14 @@ def docker(*args: str, timeout: float = 60, stdin: str | None = None) -> str:
     except subprocess.TimeoutExpired:
         raise VespaError(f"docker {args[0]} did not finish within {timeout:.0f} s") from None
     if r.returncode:
-        detail = (r.stderr or r.stdout).strip().splitlines()
-        raise VespaError(f"docker {args[0]} failed: {detail[-1] if detail else f'exit code {r.returncode}'}")
+        lines = [line for line in (r.stderr or r.stdout).splitlines() if line.strip() and "--help" not in line]
+        detail = lines[-1] if lines else f"exit code {r.returncode}"
+        hint = ("; let your user run docker: sudo usermod -aG docker $USER, then log in again"
+                if "permission denied" in detail.lower() else
+                f"; Vespa needs ports {QUERY_PORT} and {CONFIG_PORT} on 127.0.0.1: ss -ltnp shows what holds them"
+                if "already in use" in detail or "already allocated" in detail else
+                "; start Docker: sudo systemctl start docker" if "daemon" in detail.lower() else "")
+        raise VespaError(f"docker {args[0]} failed: {detail}{hint}")
     return r.stdout
 
 
@@ -99,6 +105,14 @@ def state() -> str | None:
 
 
 # ---- the application package
+
+def shown(path: pathlib.Path) -> str:
+    """path relative to the working directory when it is inside it, so messages stay short."""
+    try:
+        return str(path.relative_to(pathlib.Path.cwd()))
+    except ValueError:
+        return str(path)
+
 
 def app_dir(app: str | pathlib.Path | None) -> pathlib.Path:
     """app, else ./vespa/app, else the repo's vespa/app; it must hold services.xml."""
@@ -244,6 +258,9 @@ def documents(name: str, wanted: dict[str, str], warn) -> tuple[int, object]:
 def start(progress=None) -> None:
     """Starts the lab-vespa container (creating it on first use) and waits for its config server."""
     s = state()
+    if s == "created":  # docker run made it but could not start it (a port in use); a later start cannot either
+        docker("rm", "--force", NAME, timeout=120)
+        s = None
     if s is None:
         if progress:
             progress(f"starting {IMAGE} (the first start downloads about 1.5 GB)")
@@ -252,8 +269,18 @@ def start(progress=None) -> None:
                IMAGE, timeout=900)
     elif s != "running":
         docker("start", NAME, timeout=120)
-    wait("the config server", lambda: (reachable(f"{CONFIG_URL}/state/v1/health") or {}).get("status", {}).get("code") == "up",
-         180, progress)
+    wait("the config server", lambda: alive() and (reachable(f"{CONFIG_URL}/state/v1/health") or {}).get("status", {})
+         .get("code") == "up", 180, progress)
+
+
+def alive() -> bool:
+    """True while the container runs; fails with its last log line once it has stopped."""
+    if state() == "running":
+        return True
+    logs = subprocess.run(["docker", "logs", "--tail", "50", NAME], capture_output=True, text=True, timeout=30)
+    lines = [line for line in (logs.stdout + logs.stderr).splitlines() if "panic" in line or "error" in line.lower()]
+    raise VespaError(f"{NAME} stopped while starting: {lines[-1].strip()[:300] if lines else 'docker logs ' + NAME}; "
+                     f"lab vespa down, then lab vespa up")
 
 
 def deploy(app: str | pathlib.Path | None = None, progress=None, warn=print) -> dict:
@@ -273,7 +300,10 @@ def deploy(app: str | pathlib.Path | None = None, progress=None, warn=print) -> 
     except OSError as e:
         raise VespaError(f"cannot reach the config server at {CONFIG_URL}: {e}; lab vespa up starts it") from None
     if status != 200:
-        raise VespaError(f"Vespa refused {path}: {brief_deploy_error(str(answer.get('message', answer)))}")
+        message = str(answer.get("message", answer))
+        for name in DATASETS:  # an error in a schema made from fiqa.sd is on the same line of fiqa.sd
+            message = message.replace(f"'{name}.sd'", f"'{SOURCE}.sd'")
+        raise VespaError(f"Vespa refused {shown(path)}: {brief_deploy_error(message)}")
     wait("the new application", lambda: (reachable(f"{APPLICATION_URL}/serviceconverge") or {}).get("converged") is True,
          300, progress)
     wait("the query endpoint", ready, 300, progress)
@@ -350,13 +380,15 @@ def deployed(name: str) -> str | None:
 def unfed() -> dict[str, str]:
     """dataset -> why its documents do not hold what the deployed schema declares (not fed yet, or fed for other
     document fields); the datasets that are fine are left out."""
+    if state() != "running":
+        raise VespaError("Vespa is not running; lab vespa up starts it")
     done, out = fed(), {}
     for name in DATASETS:
         sd = deployed(name)
         if sd is None:
             out[name] = "no application is deployed"
         elif name not in done:
-            out[name] = "not fed yet"
+            out[name] = "not fed, or its last feed did not finish"
         elif done[name] != fingerprint(sd, name):
             out[name] = "fed for other document fields than the deployed schema's"
     return out
@@ -386,6 +418,8 @@ def feed(name: str, app: pathlib.Path, advance=None, warn=print) -> float:
         out.seek(0)
         err.seek(0)
         stats, errors = out.read(), err.read().strip().splitlines()
+    if code != 0 and state() != "running":
+        raise VespaError(f"{NAME} stopped while feeding {name}; lab vespa up starts it and feeds again")
     if code != 0:
         raise VespaError(f"feeding {name} failed: " + ("\n".join(errors[-5:]) or f"vespa feed exit code {code}"))
     try:

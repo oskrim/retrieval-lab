@@ -886,7 +886,7 @@ def vespa_deploy(app: str | None) -> None:
     with console.status("deploying") as status:
         answer = labvespa.deploy(path, lambda m: status.update(m), warn)
     show_changes(answer)
-    ok(f"deployed {path}")
+    ok(f"deployed {labvespa.shown(path)}")
     unfed = labvespa.unfed()
     if unfed:
         warn(f"{' and '.join(unfed)}: {'; '.join(sorted(set(unfed.values())))}; lab vespa up {app or ''}".rstrip()
