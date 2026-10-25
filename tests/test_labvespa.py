@@ -160,3 +160,16 @@ def test_a_container_that_stops_while_starting_fails_at_once(monkeypatch):
     monkeypatch.setattr(labvespa.subprocess, "run", lambda *a, **k: labvespa.subprocess.CompletedProcess(a, 0, logs, ""))
     with pytest.raises(labvespa.VespaError, match="stopped while starting: panic: this host"):
         labvespa.alive()
+
+
+def test_a_deploy_that_empties_a_field_unmarks_its_feed(tmp_path, monkeypatch):
+    marks = {"fiqa": "f1", "caiq": "c1"}
+    monkeypatch.setattr(labvespa, "state", lambda: "running")
+    monkeypatch.setattr(labvespa, "fed", lambda: dict(marks))
+    monkeypatch.setattr(labvespa, "mark", lambda done: (marks.clear(), marks.update(done)))
+    monkeypatch.setattr(labvespa, "wait", lambda *a, **k: None)
+    answer = {"configChangeActions": {"refeed": [{"documentType": "fiqa", "messages": ["field type changed"]}]}}
+    monkeypatch.setattr(labvespa, "http", lambda *a, **k: (200, answer))
+    labvespa.deploy(app(tmp_path), warn=lambda m: None)
+    assert marks == {"caiq": "c1"}
+

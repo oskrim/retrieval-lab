@@ -304,6 +304,9 @@ def deploy(app: str | pathlib.Path | None = None, progress=None, warn=print) -> 
         for name in DATASETS:  # an error in a schema made from fiqa.sd is on the same line of fiqa.sd
             message = message.replace(f"'{name}.sd'", f"'{SOURCE}.sd'")
         raise VespaError(f"Vespa refused {shown(path)}: {brief_deploy_error(message)}")
+    emptied = {a.get("documentType") for a in answer.get("configChangeActions", {}).get("refeed", [])}
+    if emptied & set(fed()):  # a changed field type empties the field, even when a later deploy changes it back
+        mark({k: v for k, v in fed().items() if k not in emptied})
     wait("the new application", lambda: (reachable(f"{APPLICATION_URL}/serviceconverge") or {}).get("converged") is True,
          300, progress)
     wait("the query endpoint", ready, 300, progress)
@@ -366,6 +369,11 @@ def fed() -> dict[str, str]:
         return json.loads(docker("exec", NAME, "sh", "-c", f"cat {MARKER} 2>/dev/null || echo '{{}}'"))
     except ValueError:
         return {}
+
+
+def mark(done: dict[str, str]) -> None:
+    """Records done (dataset -> the fingerprint of its complete feed) in the container."""
+    docker("exec", "-i", NAME, "sh", "-c", f"cat > {MARKER}", stdin=json.dumps(done))
 
 
 def deployed(name: str) -> str | None:
@@ -445,11 +453,11 @@ def up(app: str | pathlib.Path | None = None, progress=None, feeding=None, warn=
         if done.get(name) == fingerprint(schema(path, name), name):
             continue
         done.pop(name, None)  # an interrupted feed leaves the dataset unfed, not fed for its old fields
-        docker("exec", "-i", NAME, "sh", "-c", f"cat > {MARKER}", stdin=json.dumps(done))
+        mark(done)
         advance = feeding(name, len(lab.load(name).ids)) if feeding else None
         seconds[name] = feed(name, path, advance, warn)
         done[name] = fingerprint(schema(path, name), name)
-        docker("exec", "-i", NAME, "sh", "-c", f"cat > {MARKER}", stdin=json.dumps(done))
+        mark(done)
     return dict(deploy=answer, fed=seconds)
 
 
