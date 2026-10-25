@@ -1,6 +1,6 @@
 .lab.json
 __pycache__/
-data/
+data
 .ipynb_checkpoints/
 .nb.lock
 *.egg-info/
