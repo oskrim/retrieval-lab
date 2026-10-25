@@ -11,5 +11,12 @@
       <document type="fiqa" mode="index"/>
       <document type="caiq" mode="index"/>
     </documents>
+    <!-- Vespa blocks the feed when the disk is 80% full; on a lab box the models fill most of it, and the lab's data is
+         about 5 GB, so the feed stops only at 95%. -->
+    <tuning>
+      <resource-limits>
+        <disk>0.95</disk>
+      </resource-limits>
+    </tuning>
   </content>
 </services>

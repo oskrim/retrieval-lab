@@ -402,6 +402,9 @@ def unfed() -> dict[str, str]:
     return out
 
 
+FEED_BLOCK = re.compile(r"blocked due to resource exhaustion: (?:in content cluster '\w+': )?(.*?)\. See ")
+
+
 def feed(name: str, app: pathlib.Path, advance=None, warn=print) -> float:
     """Feeds dataset name with the fields app's schema declares, through the vespa CLI in the container; advance(n)
     hears of the documents sent. Returns the seconds it took."""
@@ -428,8 +431,12 @@ def feed(name: str, app: pathlib.Path, advance=None, warn=print) -> float:
         stats, errors = out.read(), err.read().strip().splitlines()
     if code != 0 and state() != "running":
         raise VespaError(f"{NAME} stopped while feeding {name}; lab vespa up starts it and feeds again")
+    blocked = next((m.group(1) for e in errors if (m := FEED_BLOCK.search(e))), None)
+    if blocked:
+        raise VespaError(f"Vespa blocks the feed: {blocked}; free some space, then lab vespa up")
     if code != 0:
-        raise VespaError(f"feeding {name} failed: " + ("\n".join(errors[-5:]) or f"vespa feed exit code {code}"))
+        raise VespaError(f"feeding {name} failed: " + ("\n".join(cut(e)[:MAX_LINE] for e in errors[-3:])
+                                                       or f"vespa feed exit code {code}"))
     try:
         ok = json.loads(stats).get("feeder.ok.count")
     except ValueError:

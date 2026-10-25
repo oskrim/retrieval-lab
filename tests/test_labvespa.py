@@ -173,3 +173,27 @@ def test_a_deploy_that_empties_a_field_unmarks_its_feed(tmp_path, monkeypatch):
     labvespa.deploy(app(tmp_path), warn=lambda m: None)
     assert marks == {"caiq": "c1"}
 
+
+def test_a_blocked_feed_says_why_in_one_line(tmp_path, monkeypatch):
+    error = ('feed: got status 507 ({"message":"[UNKNOWN(251009) @ tcp/lab-vespa:19115/default]: ReturnCode(NO_SPACE, '
+             "External feed is blocked due to resource exhaustion: in content cluster 'content': disk on node 0 [lab-vespa] "
+             'is 80.2% full (the configured limit is 80.0%). See https://docs.vespa.ai/en/writing/feed-block.html) "})')
+
+    class Feed:  # vespa feed in the container: reads every line, then fails
+        def __init__(self, cmd, stdin, stdout, stderr, text):
+            self.stdin, self.stderr = open(tmp_path / "in", "w"), stderr
+            stderr.write(error + "\n")
+
+        def wait(self, timeout):
+            return 1
+
+        def poll(self):
+            return 1
+
+    monkeypatch.setattr(labvespa.subprocess, "Popen", Feed)
+    monkeypatch.setattr(labvespa, "documents", lambda name, wanted, warn: (1, iter(["{}\n"])))
+    monkeypatch.setattr(labvespa, "state", lambda: "running")
+    with pytest.raises(labvespa.VespaError) as e:
+        labvespa.feed("fiqa", app(tmp_path))
+    assert str(e.value) == ("Vespa blocks the feed: disk on node 0 [lab-vespa] is 80.2% full (the configured limit is "
+                            "80.0%); free some space, then lab vespa up")
