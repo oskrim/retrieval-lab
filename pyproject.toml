@@ -28,4 +28,4 @@ dependencies = [
 lab = "cli:main"
 
 [tool.setuptools]
-py-modules = ["lab", "cli"]
+py-modules = ["lab", "cli", "labvespa"]
