@@ -130,7 +130,7 @@ def package(app: pathlib.Path, warn=print) -> bytes:
         for f in sorted(app.rglob("*")):
             rel = f.relative_to(app).as_posix()
             if rel in made:
-                warn(f"{f} is not used: every deploy makes {f.name} from {SOURCE}.sd; edit {SOURCE}.sd only")
+                warn(f"{shown(f)} is not used: every deploy makes {f.name} from {SOURCE}.sd; edit {SOURCE}.sd only")
             elif f.is_file() and not f.name.startswith("."):
                 z.write(f, rel)
         for name in DATASETS:
