@@ -222,13 +222,13 @@ def history() -> list[dict]:
 
 @functools.lru_cache(maxsize=None)
 def file_key(file: str) -> str:
-    """The file's path relative to its git repository (search.py, vespa/search.py), else its name: evals compare files
-    by it, so search.py and vespa/search.py stay apart and the same file in another clone is the same."""
+    """The file's path in its git repository (search.py, vespa/search.py), else its whole path: evals compare files by
+    it, so search.py and vespa/search.py stay apart and the same file in another clone is the same."""
     path = pathlib.Path(file)
     for parent in path.parents:
         if (parent / ".git").exists():
             return path.relative_to(parent).as_posix()
-    return path.name
+    return str(path)
 
 
 def same_file(past: list[dict], kind: str, dataset: str, file: str) -> list[dict]:
