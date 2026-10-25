@@ -141,14 +141,23 @@ def test_eval_history_skips_lines_that_are_not_evals(evals):
     assert rows[0]["per"] == {"q1": 1.0, "q2": 0.0} and rows[0]["questions"] == 2 and rows[0]["run"] == 1.0
 
 
-def test_previous_is_the_latest_eval_of_the_file_and_best_the_highest_of_any_file():
-    rows = [ev(1, "/w/a.py", 0.50), ev(2, "/w/b.py", 0.60), ev(3, "/w/a.py", 0.40), ev(4, "/w/c.py", 0.60),
+def test_previous_and_best_are_the_latest_and_highest_eval_of_the_same_file():
+    rows = [ev(1, "/w/a.py", 0.50), ev(2, "/w/b.py", 0.60), ev(3, "/w/a.py", 0.40), ev(4, "/w/a.py", 0.50),
             ev(5, "/w/a.py", 0.90, dataset="caiq test"), ev(6, "/w/a.py", 0.99, kind="agent", dataset="crm dev")]
-    assert cli.previous(rows, "search", "fiqa dev", "/w/a.py")["at"] == 3
+    assert cli.previous(rows, "search", "fiqa dev", "/w/a.py")["at"] == 4
     assert cli.previous(rows, "search", "fiqa dev", "/w/new.py") is None
-    assert cli.best(rows, "search", "fiqa dev")["at"] == 2  # the earliest of two equal bests
-    assert cli.best(rows, "search", "caiq test")["at"] == 5
-    assert cli.best(rows, "agent", "fiqa dev") is None
+    assert cli.best(rows, "search", "fiqa dev", "/w/a.py")["at"] == 1  # the earliest of two equal bests; not b.py's
+    assert cli.best(rows, "search", "caiq test", "/w/a.py")["at"] == 5
+    assert cli.best(rows, "agent", "fiqa dev", "/w/a.py") is None
+
+
+def test_files_are_told_apart_by_their_path_in_the_repo(tmp_path):
+    for clone in ("one", "two"):
+        (tmp_path / clone / ".git").mkdir(parents=True)
+    assert cli.file_key(str(tmp_path / "one" / "vespa" / "search.py")) == "vespa/search.py"
+    rows = [ev(1, str(tmp_path / "one" / "search.py"), 0.6), ev(2, str(tmp_path / "two" / "vespa" / "search.py"), 0.5)]
+    assert cli.previous(rows, "search", "fiqa dev", str(tmp_path / "one" / "vespa" / "search.py"))["at"] == 2
+    assert cli.best(rows, "search", "fiqa dev", str(tmp_path / "two" / "search.py"))["at"] == 1
 
 
 def test_flips_count_the_questions_that_scored_higher_and_lower():
@@ -174,18 +183,21 @@ def test_sparkline():
     assert cli.sparkline([0.5, 0.5]) == "▄▄"
 
 
-def test_the_result_screen_fits_80_columns(evals):
-    rows = [ev(1, "/w/search.py", 0.55, run=1, per={"q1": 0.5, "q2": 1.0}),
-            ev(1, "/w/search.py", 0.70, dataset="caiq test", run=1),
-            ev(2, "/w/a_rather_long_file_name_for_search.py", 0.60, run=2)]
+def test_the_result_screen_fits_80_columns_with_whole_file_names(evals, tmp_path):
+    (tmp_path / ".git").mkdir()
+    mine, long = str(tmp_path / "vespa" / "search.py"), str(tmp_path / "experiments" / "a_rather_long_file_name_for_search.py")
+    rows = [ev(1, mine, 0.55, run=1), ev(1, mine, 0.70, dataset="caiq test", run=1), ev(2, long, 0.60, run=2),
+            ev(3, mine, 0.50, run=3, per={"q1": 0.5, "q2": 1.0})]
     results = [cli.result("fiqa dev", {"q1": 0.25, "q2": 1.0}), cli.result("caiq test", {"q9": 1.0})]
     out = cli.Console(width=80, record=True, file=open(os.devnull, "w"))
-    out.print(cli.runs_table("search", cli.EVAL_LABELS, rows))
-    out.print(cli.result_table(pathlib.Path("/w/search.py"), "search", "nDCG@10", results, rows, 3.2))
+    out.print(cli.runs_table("search", cli.EVAL_LABELS, rows, mine))
+    out.print(cli.result_table(pathlib.Path(mine), "search", "nDCG@10", results, rows, 3.2))
     text = out.export_text()
     assert max(map(cell_len, text.splitlines())) <= 80
-    assert "↑0 ↓1" in text and "★" in text and "0.600 " in text and "a_rather" in text
-    assert "0.550" in text and "–" in text  # the previous eval of search.py; no flips without per-question scores
+    assert "experiments/a_rather_long_file_name_for_search" in text and "…" not in text  # folded, not cut
+    assert "vespa/search.py · nDCG@10" in text and "↑0 ↓1" in text and "★" in text
+    assert "0.500" in text and "0.550" in text  # previous and best before: vespa/search.py's, not the long file's 0.600
+    assert cli.runs_table("search", cli.EVAL_LABELS, rows, mine, n=0) is None
 
 
 def test_agent_eval_marks_the_questions_that_flipped(tmp_path, evals, capsys, monkeypatch):

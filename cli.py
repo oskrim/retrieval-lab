@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import importlib.util
 import io
 import json
@@ -219,15 +220,30 @@ def history() -> list[dict]:
     return rows
 
 
+@functools.lru_cache(maxsize=None)
+def file_key(file: str) -> str:
+    """The file's path relative to its git repository (search.py, vespa/search.py), else its name: evals compare files
+    by it, so search.py and vespa/search.py stay apart and the same file in another clone is the same."""
+    path = pathlib.Path(file)
+    for parent in path.parents:
+        if (parent / ".git").exists():
+            return path.relative_to(parent).as_posix()
+    return path.name
+
+
+def same_file(past: list[dict], kind: str, dataset: str, file: str) -> list[dict]:
+    key = file_key(file)
+    return [r for r in past if (r["kind"], r["dataset"]) == (kind, dataset) and file_key(r["file"]) == key]
+
+
 def previous(past: list[dict], kind: str, dataset: str, file: str) -> dict | None:
-    """The latest eval of file on dataset."""
-    return max((r for r in past if (r["kind"], r["dataset"], r["file"]) == (kind, dataset, file)),
-               key=lambda r: r["at"], default=None)
+    """The latest eval of file (by file_key) on dataset."""
+    return max(same_file(past, kind, dataset, file), key=lambda r: r["at"], default=None)
 
 
-def best(past: list[dict], kind: str, dataset: str) -> dict | None:
-    """The highest eval of any file on dataset; the earliest of equal ones."""
-    return max((r for r in past if (r["kind"], r["dataset"]) == (kind, dataset)), key=lambda r: r["score"], default=None)
+def best(past: list[dict], kind: str, dataset: str, file: str) -> dict | None:
+    """The highest eval of file (by file_key) on dataset; the earliest of equal ones."""
+    return max(same_file(past, kind, dataset, file), key=lambda r: r["score"], default=None)
 
 
 def flips(before: dict | None, per: dict[str, float]) -> tuple[int, int] | None:
@@ -293,63 +309,59 @@ def when(at: float) -> str:
     return time.strftime("%H:%M" if t[:3] == time.localtime()[:3] else "%a %H:%M", t)
 
 
-def short(file: str, width: int = 16) -> str:
-    name = pathlib.Path(file).name
-    return name if len(name) <= width else name[:width - 1] + "…"
-
-
-def earlier(r: dict | None, file: bool = True) -> Text:
-    """An earlier eval's score, time and file, or a dash."""
+def earlier(r: dict | None) -> Text:
+    """An earlier eval's score and time, or a dash."""
     if r is None:
         return Text("–", style="dim")
-    return Text.assemble(f"{r['score']:.3f}", (f" {when(r['at'])}" + (f" {short(r['file'])}" if file else ""), "dim"))
+    return Text.assemble(f"{r['score']:.3f}", (f" {when(r['at'])}", "dim"))
 
 
 def result_table(path: pathlib.Path, kind: str, metric: str, results: list[Result], past: list[dict],
                  elapsed: float, caption: str = "") -> Table:
-    """This run's scores, each next to the previous eval of the same file and the best earlier eval of any file."""
+    """This run's scores, each next to the previous and the best earlier eval of the same file (by file_key)."""
     cells, record = [], False
     for r in results:
-        before, top = previous(past, kind, r.dataset, str(path)), best(past, kind, r.dataset)
+        before, top = previous(past, kind, r.dataset, str(path)), best(past, kind, r.dataset, str(path))
         moved = flips(before, r.per)
         new_best = top is not None and r.score > top["score"]
         record |= new_best
         cells.append([Text(r.dataset), Text.assemble((f"{r.score:.3f}", "num"), (" ★", "ok") if new_best else "  "),
                       Text(f"{r.lo:.3f}–{r.hi:.3f}"),
                       Text.assemble((f"↑{moved[0]}", "ok"), " ", (f"↓{moved[1]}", "err")) if moved else Text("–", "dim"),
-                      earlier(before, file=False), earlier(top)])
-    table = Table(title=f"{path.name} · {metric} · {elapsed:.1f} s", title_justify="left", title_style="bold",
+                      earlier(before), earlier(top)])
+    key = file_key(str(path))
+    table = Table(title=f"{key} · {metric} · {elapsed:.1f} s", title_justify="left", title_style="bold",
                   box=None, padding=(0, 1), caption_style="dim", caption_justify="left")
     for i, (header, justify) in enumerate(((("dataset", "left"), (metric, "right"), ("95% interval", "right"),
                                             ("↑ ↓", "right"), ("previous", "left"), ("best before", "left")))):
-        # in a narrow terminal only the last column gives way, cutting its file name short
-        width = max([len(header)] + [c[i].cell_len for c in cells]) if i < 5 else None
-        table.add_column(header, justify=justify, header_style="dim", no_wrap=True, overflow="ellipsis", min_width=width)
+        width = max([len(header)] + [c[i].cell_len for c in cells])
+        table.add_column(header, justify=justify, header_style="dim", no_wrap=True, min_width=width)
     for c in cells:
         table.add_row(*c)
-    notes = [f"previous: the last eval of {path.name} · ↑ ↓ questions now higher, lower"]
+    notes = [f"previous, best before: the last and the best earlier eval of {key} · ↑ ↓ questions now higher, lower"]
     if record:
         notes.append("★ above every earlier eval")
     table.caption = "\n".join(([caption] if caption else []) + notes)
     return table
 
 
-def runs_table(kind: str, datasets: list[str], past: list[dict], n: int = 5, trend: int = 20) -> Table | None:
-    """The last n earlier runs of kind, oldest first, and a sparkline of each dataset over the last trend runs."""
-    runs = recent_runs(past, kind, trend)
-    if not runs:
+def runs_table(kind: str, datasets: list[str], past: list[dict], file: str, n: int = 5, trend: int = 20) -> Table | None:
+    """The last n earlier runs of kind, oldest first, and a sparkline of each dataset over file's last trend runs."""
+    runs = recent_runs(past, kind, 10_000)
+    if not runs or n <= 0:
         return None
     table = Table(title="earlier evals", title_justify="left", title_style="dim", box=None, padding=(0, 1))
     table.add_column("", style="dim", no_wrap=True)
-    table.add_column("file", no_wrap=True, overflow="ellipsis", max_width=24)
+    table.add_column("file", overflow="fold")
     for d in datasets:
         table.add_column(d, justify="right", header_style="dim", no_wrap=True)
     for first, scores in runs[-n:]:
-        table.add_row(when(first["at"]), short(first["file"], 24),
+        table.add_row(when(first["at"]), file_key(first["file"]),
                       *(f"{scores[d]:.3f}" if d in scores else Text("–", "dim") for d in datasets))
-    lines = [[scores[d] for _, scores in runs if d in scores] for d in datasets]
+    mine = [scores for first, scores in runs if file_key(first["file"]) == file_key(file)][-trend:]
+    lines = [[scores[d] for scores in mine if d in scores] for d in datasets]
     if any(len(v) > 1 for v in lines):
-        table.add_row(f"last {len(runs)}", "", *(Text(sparkline(v), "acc") if len(v) > 1 else "" for v in lines))
+        table.add_row(f"last {len(mine)}", file_key(file), *(Text(sparkline(v), "acc") if len(v) > 1 else "" for v in lines))
     return table
 
 
@@ -370,7 +382,7 @@ def quiet_models() -> None:
 
 # ---- eval
 
-def eval_search(path: pathlib.Path, module, worst: int, only: str | None) -> None:
+def eval_search(path: pathlib.Path, module, worst: int, only: str | None, history_rows: int) -> None:
     search = checked_search(module, path)
     run = time.time()
     with console.status("loading the data"):
@@ -389,7 +401,8 @@ def eval_search(path: pathlib.Path, module, worst: int, only: str | None) -> Non
     past = history()
     if worst:
         show_worst_search(sets, scores, ranked, worst)
-    show_end(runs_table("search", EVAL_LABELS, past), result_table(path, "search", "nDCG@10", results, past, elapsed))
+    show_end(runs_table("search", EVAL_LABELS, past, str(path), history_rows),
+             result_table(path, "search", "nDCG@10", results, past, elapsed))
     if lab.rerank_misses[0]:
         console.print(f"[warn]![/] {lab.rerank_misses[0]:,} reranker pairs missed the cache and scored lowest (no GPU to "
                       "score them)")
@@ -423,7 +436,7 @@ def doc_line(ds: lab.Dataset, prefix: str, i: int, grade: int) -> None:
 AGENT_SET = "crm dev"
 
 
-def eval_agent(path: pathlib.Path, module, worst: int) -> None:
+def eval_agent(path: pathlib.Path, module, worst: int, history_rows: int) -> None:
     with contextlib.redirect_stderr(io.StringIO()):  # the model is named in the caption below
         url, _, model = require_agent()
     where = "on this machine" if url.startswith(lab.VLLM_URL) else "through the lab"
@@ -457,7 +470,7 @@ def eval_agent(path: pathlib.Path, module, worst: int) -> None:
         moved = ("↑ ", "ok") if was == 0 and res.per[q] else ("↓ ", "err") if was == 1 and not res.per[q] else "  "
         console.print(Text.assemble("  ", ("✓ ", "ok") if res.per[q] else ("✗ ", "err"), moved, q),
                       no_wrap=True, overflow="ellipsis")
-    show_end(runs_table("agent", [AGENT_SET], past),
+    show_end(runs_table("agent", [AGENT_SET], past, str(path), history_rows),
              result_table(path, "agent", "exact", [res], past, elapsed, f"agent model {model} {where}"))
     remember(path, "agent", run, res)
 
@@ -466,11 +479,11 @@ def cmd_eval(args) -> None:
     quiet_models()
     path, module = load_file(args.file)
     if file_kind(module) == "search":
-        eval_search(path, module, args.worst, args.data)
+        eval_search(path, module, args.worst, args.data, args.history)
     elif args.data:
         raise Fail("--data picks a search dataset; an agent file runs on the CRM questions")
     else:
-        eval_agent(path, module, args.worst)
+        eval_agent(path, module, args.worst, args.history)
 
 
 # ---- submit
@@ -945,6 +958,7 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("file")
     s.add_argument("--worst", type=int, default=0, metavar="N", help="also show the N worst questions")
     s.add_argument("--data", choices=[name for name, _ in EVAL_SETS], help="only this dataset (search files)")
+    s.add_argument("--history", type=int, default=5, metavar="N", help="show the last N earlier evals (default 5)")
     s.set_defaults(run=cmd_eval)
     s = sub.add_parser("submit", help="run your file on the board's questions and send the results")
     s.add_argument("file")
