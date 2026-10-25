@@ -278,3 +278,52 @@ def test_vllm_args_fill_the_snapshot_and_leave_memory_for_the_reranker(monkeypat
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda i: (24e9, 24e9))
     with pytest.raises(cli.Fail):
         cli.vllm_args()
+
+
+def test_new_vespa_copies_the_app_search_and_nick_and_keeps_what_is_there(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "my_nick", lambda: "ada")
+    assert cli.main(["new", "vespa"]) == 0
+    assert (tmp_path / "vespa" / "app" / "schemas" / "fiqa.sd").read_text() == (cli.labvespa.APP / "schemas" / "fiqa.sd").read_text()
+    assert (tmp_path / "vespa" / "search.py").read_text() == (cli.TEMPLATES / "vespa" / "search.py").read_text()
+    assert (tmp_path / "vespa" / "NICK").read_text().splitlines()[1:] == ["ada"]
+    (tmp_path / "vespa" / "app" / "services.xml").write_text("mine")
+    (tmp_path / "vespa" / "NICK").unlink()
+    assert cli.main(["new", "vespa"]) == 0
+    assert (tmp_path / "vespa" / "app" / "services.xml").read_text() == "mine"
+    assert "wrote vespa/NICK · kept app, search.py" in capsys.readouterr().out
+    assert cli.main(["new", "vespa"]) == 1
+    assert "has app, search.py and NICK already" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("argv, called", [
+    (["vespa", "up"], ("up", None)),
+    (["vespa", "up", "fork/vespa/app"], ("up", "fork/vespa/app")),
+    (["vespa", "deploy", "vespa/app"], ("deploy", "vespa/app")),
+    (["vespa", "down"], ("down", None)),
+    (["vespa", "status"], ("status", None)),
+])
+def test_vespa_commands(argv, called, monkeypatch):
+    seen = []
+    for action in ("up", "deploy", "down", "status"):
+        monkeypatch.setattr(cli, f"vespa_{action}", lambda app, action=action: seen.append((action, app)))
+    assert cli.main(argv) == 0
+    assert seen == [called]
+
+
+def test_vespa_down_and_status_take_no_app(capsys):
+    assert cli.main(["vespa", "down", "vespa/app"]) == 1
+    assert "takes no application directory" in capsys.readouterr().out
+
+
+def test_vespa_errors_are_not_blamed_on_the_participant(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(cli.labvespa, "query", lambda *a, **k: (_ for _ in ()).throw(cli.labvespa.VespaError("Vespa does not answer")))
+    path = write(tmp_path, "s.py", """
+        import labvespa
+        def search(ds, question, k=10):
+            return labvespa.query(ds.name, "select * from fiqa where true", "hybrid")
+    """)
+    monkeypatch.setattr(cli.lab, "load", lambda name, split="test": cli.lab.Dataset(name, ["a"], [""], [""], {"q": "x"}, {"q": {"a": 1}}, {}))
+    assert cli.main(["eval", str(path)]) == 1
+    out = capsys.readouterr().out
+    assert "Vespa does not answer" in out and "s.py raised" not in out

@@ -9,6 +9,7 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import signal
 import subprocess
 import sys
@@ -34,6 +35,7 @@ from rich.text import Text
 from rich.theme import Theme
 
 import lab
+import labvespa
 
 HOME = pathlib.Path(os.environ.get("LAB_HOME", "~/.lab")).expanduser()
 VENV = HOME / "vllm-venv"
@@ -171,7 +173,7 @@ def checked_search(module, path: pathlib.Path):
     def run(ds: lab.Dataset, question: str, k: int = 10) -> list[int]:
         try:
             rows = module.search(ds, question, k=k)
-        except (lab.LabError, lab.ModelError):
+        except (lab.LabError, lab.ModelError, labvespa.VespaError):
             raise
         except (Exception, SystemExit) as e:
             raise UserCodeError(e, path) from None
@@ -792,6 +794,9 @@ def cmd_connect(args) -> None:
 
 
 def cmd_new(args) -> None:
+    if args.kind == "vespa":
+        new_vespa(pathlib.Path.cwd() / "vespa")
+        return
     target = pathlib.Path.cwd() / f"{args.kind}.py"
     try:
         with open(target, "x") as f:
@@ -801,6 +806,117 @@ def cmd_new(args) -> None:
     except OSError as e:
         raise Fail(f"cannot write {target}: {e.strerror}; run lab new in a directory of yours") from None
     ok(f"wrote {target.name} · next: lab eval {target.name}")
+
+
+NICK_FILE = "# your nick on the lab board: the organizer grades this branch under it\n{nick}\n"
+
+
+def new_vespa(target: pathlib.Path) -> None:
+    """target/app (the lab's Vespa application), target/search.py and target/NICK, each unless it is there already."""
+    wrote, kept = [], []
+    try:
+        target.mkdir(exist_ok=True)
+        if (target / "app").exists():
+            kept.append("app")
+        else:
+            shutil.copytree(labvespa.APP, target / "app")
+            wrote.append("app")
+        for name, text in (("search.py", lambda: (TEMPLATES / "vespa" / "search.py").read_text()),
+                           ("NICK", lambda: NICK_FILE.format(nick=my_nick() or "your-nick"))):
+            if (target / name).exists():
+                kept.append(name)
+            else:
+                (target / name).write_text(text())
+                wrote.append(name)
+    except OSError as e:
+        raise Fail(f"cannot write {target}: {e.strerror}; run lab new in a directory of yours") from None
+    if not wrote:
+        raise Fail(f"{target.name}/ has app, search.py and NICK already; rename or remove what you want new")
+    ok(f"wrote {', '.join(f'{target.name}/{w}' for w in wrote)}" + (f" · kept {', '.join(kept)}" if kept else "")
+       + f" · next: lab vespa up, then lab eval {target.name}/search.py")
+
+
+def my_nick() -> str | None:
+    """The nick of the connected participant, or None when not connected."""
+    try:
+        return lab.call("/api/me")["nick"] if lab.LAB.exists() else None
+    except (RuntimeError, OSError, KeyError, ValueError):  # lab.LabError, an unreachable lab, a reply without a nick
+        return None
+
+
+# ---- vespa
+
+def cmd_vespa(args) -> None:
+    if args.app and args.action in ("down", "status"):
+        raise Fail(f"lab vespa {args.action} takes no application directory")
+    {"up": vespa_up, "deploy": vespa_deploy, "down": vespa_down, "status": vespa_status}[args.action](args.app)
+
+
+def vespa_up(app: str | None) -> None:
+    start = time.time()
+    with progress(MofNCompleteColumn()) as bar:
+        step = bar.add_task("starting Vespa", total=None)
+
+        def feeding(name: str, total: int):
+            bar.update(step, visible=False)
+            task = bar.add_task(f"feeding {name}", total=total)
+            return lambda n: bar.advance(task, n)
+
+        result = labvespa.up(app, lambda m: bar.update(step, description=m), feeding, warn)
+    show_changes(result["deploy"])
+    fed = " · ".join(f"fed {name} in {s:.0f} s" for name, s in result["fed"].items()) or "the data was fed before"
+    ok(f"Vespa is up at {labvespa.QUERY_URL} · {fed} · {time.time() - start:.0f} s in all")
+
+
+def vespa_deploy(app: str | None) -> None:
+    path = labvespa.app_dir(app)
+    with console.status("deploying") as status:
+        answer = labvespa.deploy(path, lambda m: status.update(m))
+    show_changes(answer)
+    done = labvespa.fed()
+    stale = [n for n in labvespa.DATASETS if done.get(n) != labvespa.fingerprint(path, n)]
+    ok(f"deployed {path}")
+    if stale:
+        console.print(f"[warn]![/] the document fields of {' and '.join(stale)} changed since the feed: "
+                      f"lab vespa up {app or ''}".rstrip() + " feeds them again")
+
+
+def show_changes(answer: dict) -> None:
+    """Vespa's warnings on a deploy, and what it needs restarted, refed or reindexed."""
+    lines = labvespa.changes(answer)
+    for line in lines:
+        warn(line)
+    if any(line.startswith("restart") for line in lines):
+        warn(f"to restart: docker restart {labvespa.NAME}, then lab vespa up")
+    if any(line.startswith("reindex") for line in lines):
+        warn("Vespa reindexes the documents in the background")
+
+
+def warn(message: str) -> None:
+    console.print(Text.assemble(("! ", "warn"), message))
+
+
+def vespa_down(app: str | None) -> None:
+    ok(f"removed {labvespa.NAME} and its data" if labvespa.down() else f"no {labvespa.NAME} container")
+
+
+def vespa_status(app: str | None) -> None:
+    with console.status("checking"):
+        s = labvespa.status()
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="dim")
+    grid.add_column()
+    grid.add_row("container", f"{labvespa.NAME} · {s['image']} · " + (
+        f"[ok]{s['state']}[/]" if s["state"] == "running" else f"[warn]{s['state'] or 'none'}[/] · lab vespa up"))
+    if s["state"] == "running":
+        grid.add_row("memory", s["memory"])
+        grid.add_row("queries", f"{s['query']} · " + ("[ok]serving[/]" if s["serving"] else "[warn]not serving[/] · lab vespa up"))
+        path = labvespa.app_dir(None)
+        for name, d in s["datasets"].items():
+            current = d["fed"] == labvespa.fingerprint(path, name)
+            grid.add_row(name, f"{d['documents'] if d['documents'] is not None else '–'} documents · " + (
+                "[ok]fed[/]" if current else "[warn]not fed for these fields[/] · lab vespa up"))
+    console.print(Panel(grid, title="lab vespa status", title_align="left", border_style="acc", expand=False))
 
 
 # ---- main
@@ -822,8 +938,12 @@ def parser() -> argparse.ArgumentParser:
     s = sub.add_parser("status", help="GPU, vLLM, lab connection, data and models")
     s.set_defaults(run=cmd_status)
     s = sub.add_parser("new", help="copy a working template into this directory")
-    s.add_argument("kind", choices=("search", "agent"))
+    s.add_argument("kind", choices=("search", "agent", "vespa"))
     s.set_defaults(run=cmd_new)
+    s = sub.add_parser("vespa", help="your own Vespa in Docker: up, deploy, down, status")
+    s.add_argument("action", choices=("up", "deploy", "down", "status"))
+    s.add_argument("app", nargs="?", help="the application directory (default: ./vespa/app, else the lab's)")
+    s.set_defaults(run=cmd_vespa)
     s = sub.add_parser("eval", help="score your file on the dev questions")
     s.add_argument("file")
     s.add_argument("--worst", type=int, default=0, metavar="N", help="also show the N worst questions")
