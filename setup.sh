@@ -34,6 +34,8 @@ python3 -c 'import ensurepip' 2> /dev/null || missing+=(python3-venv)
 # vLLM compiles kernels when the model server starts: Triton needs Python.h, FlashInfer needs ninja.
 [ -f "$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["include"])')/Python.h" ] || missing+=(python3-dev)
 command -v ninja > /dev/null || missing+=(ninja-build)
+# The Vespa track runs Vespa in Docker.
+command -v docker > /dev/null || missing+=(docker.io)
 if [ ${#missing[@]} -gt 0 ]; then
   sudo=
   [ "$(id -u)" = 0 ] || sudo=sudo
@@ -64,6 +66,8 @@ if [ "$STEPS" = all ]; then
   "$REPO/.venv/bin/pip" install -q -e "$REPO"
   begin "lab setup"
   (cd "$REPO" && .venv/bin/lab setup)
+  begin "vespa up"
+  (cd "$REPO" && .venv/bin/lab vespa up)
 fi
 
 begin done
