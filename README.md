@@ -89,7 +89,7 @@ Read the top of `vespa/search.py` for things to try.
 | You change | Then run | Time |
 |---|---|---|
 | A `query(...)` input in `vespa/search.py` (you can set them per dataset) | `lab eval vespa/search.py` | No deploy. Eval: about 6 s for hybrid, 25–45 s with maxsim or rerank. |
-| A rank profile in `vespa/app/schemas/fiqa.sd` | `lab vespa deploy`, then eval | |
+| A rank profile in `vespa/app/schemas/fiqa.sd` | `lab vespa deploy`, then eval | Deploy: about 4 s. |
 | A field type in `fiqa.sd` | `lab vespa up` (feeds the data again) | About 1.5 min. Eval refuses until you run it. |
 
 Edit only `fiqa.sd`. `lab vespa deploy` makes `caiq.sd` from it.
