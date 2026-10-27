@@ -101,7 +101,7 @@ schema dataset {
   #   phases               first-phase over every match; second-phase { rerank-count: N  expression: ... } over the
   #                        best N; global-phase { rerank-count: N  expression: ... } after them, where firstPhase,
   #                        secondPhase and normalize_linear(x) (scales a score to 0..1 over the N) work
-  # Rename the profile freely; search.py's PROFILE names the one it queries.
+  #
   rank-profile matching inherits common {
     # YOUR SEARCH ALGORITHM HERE. For now notebook 4: how many of the question's words the body contains.
     first-phase {
