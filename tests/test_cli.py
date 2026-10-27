@@ -622,10 +622,10 @@ def latest(live, seen):
 def test_lab_model_switches_the_agent_between_the_local_model_and_the_api(connected, capsys, monkeypatch):
     monkeypatch.setattr(cli.lab, "local_agent_model", lambda: cli.lab.AGENT_MODEL)
     monkeypatch.setattr(cli.lab, "_AGENT", [])
-    assert cli.lab.agent_endpoint()[2] == cli.lab.AGENT_MODEL  # the local one, when it runs
+    assert cli.lab.agent_endpoint()[2] == cli.lab.LAB_AGENT_MODEL  # the API's by default, even with a local one
+    assert cli.main(["model", "local"]) == 0
+    monkeypatch.setattr(cli.lab, "_AGENT", [])
+    assert cli.lab.agent_endpoint()[2] == cli.lab.AGENT_MODEL
     assert cli.main(["model", "api"]) == 0 and "the one grading uses" in capsys.readouterr().out
     monkeypatch.setattr(cli.lab, "_AGENT", [])
     assert cli.lab.agent_endpoint()[2] == cli.lab.LAB_AGENT_MODEL
-    assert cli.main(["model", "local"]) == 0 and cli.main(["model"]) == 0
-    monkeypatch.setattr(cli.lab, "_AGENT", [])
-    assert cli.lab.agent_endpoint()[2] == cli.lab.AGENT_MODEL

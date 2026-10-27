@@ -196,13 +196,6 @@ EOF
   systemctl restart lab-jupyter.service
 fi
 
-if [ "$STEPS" = all ]; then
-  begin "agent model"
-  # Starts vLLM on a large GPU and keeps it running; elsewhere it says there is nothing to serve. Not fatal: the Vespa
-  # track works without it, and lab serve tries again.
-  "$REPO/.venv/bin/lab" serve --timeout 1800 || echo "agent model did not start · lab serve tries again"
-fi
-
 if [ -n "${1:-}" ]; then
   begin connect
   "$REPO/.venv/bin/lab" connect "${LAB_URL:-https://lab.tryrealm.dev}" "$1" \

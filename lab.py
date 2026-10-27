@@ -810,19 +810,19 @@ _AGENT_LOCK = threading.Lock()
 
 
 def agent_endpoint() -> tuple[str, dict[str, str], str]:
-    """Where chat sends its messages, chosen once per process and said in one line: the local vLLM when it serves
-    AGENT_MODEL, else the lab server's model (LAB_AGENT_MODEL, within your budget there); lab model api picks the
-    lab's model even when the local one runs (grading uses the lab's)."""
+    """Where chat sends its messages, chosen once per process and said in one line: the lab server's model
+    (LAB_AGENT_MODEL, the one grading uses, within your budget there); after lab model local, the local vLLM when it
+    serves AGENT_MODEL (lab serve), as also when this machine is not connected to the lab."""
     with _AGENT_LOCK:
         if not _AGENT:
-            api = LAB.exists() and json.loads(LAB.read_text()).get("agent") == "api"
+            api = LAB.exists() and json.loads(LAB.read_text()).get("agent", "api") == "api"
             if not api and local_agent_model() == AGENT_MODEL:
                 _AGENT.append((f"{VLLM_URL}/chat/completions", {}, AGENT_MODEL))
                 print(f"agent model: {AGENT_MODEL} on this machine", file=sys.stderr)
             elif LAB.exists():
                 lab = json.loads(LAB.read_text())
                 _AGENT.append((f"{lab['url']}/v1/chat/completions", {"Authorization": f"Bearer {lab['token']}"}, LAB_AGENT_MODEL))
-                why = "lab model api" if api else f"{AGENT_MODEL} is not running here"
+                why = "lab model local uses this machine's GPU" if api else f"{AGENT_MODEL} is not running here; lab serve"
                 print(f"agent model: {LAB_AGENT_MODEL} through the API ({why})", file=sys.stderr)
             else:
                 raise RuntimeError("no agent model: start one with lab serve (GPU), or connect to the lab with lab connect")

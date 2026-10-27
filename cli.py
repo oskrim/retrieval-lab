@@ -1589,9 +1589,10 @@ def cmd_status(args) -> None:
     grid.add_column()
     grid.add_row("mode", "GPU" if found else f"[warn]{NO_GPU.removeprefix('no GPU: ')}[/]")
     grid.add_row("GPU", f"{found[0]} · {gb(found[1])} free of {gb(found[2])}" if found else "[warn]none[/]")
-    grid.add_row("agent", f"[ok]{model}[/] on this machine" if model == lab.AGENT_MODEL else
+    local = lab.LAB.exists() and json.loads(lab.LAB.read_text()).get("agent", "api") == "local"
+    grid.add_row("agent", f"[ok]{model}[/] on this machine" if local and model == lab.AGENT_MODEL else
                  f"{lab.LAB_AGENT_MODEL} through the API{budget_left(me)}"
-                 + (f" · lab serve runs {lab.AGENT_MODEL} here" if big_gpu(found) else ""))
+                 + (f" · lab serve, then lab model local, runs {lab.AGENT_MODEL} here" if big_gpu(found) and not local else ""))
     grid.add_row("lab", conn)
     for kind, handin, show in handins:
         if handin is not None:
@@ -1641,17 +1642,21 @@ def cmd_update(args) -> None:
 
 
 def cmd_model(args) -> None:
-    """Which model lab eval and lab query run the agent on: local (the GPU's, when lab serve runs it) or api (the lab's,
-    which grading uses)."""
+    """Which model lab eval and lab query run the agent on: api (the lab's, which grading uses; the default) or local
+    (this machine's GPU, once lab serve runs it)."""
     if not lab.LAB.exists():
         raise Fail("not connected to the lab; run the setup line from your lab page")
     conn = json.loads(lab.LAB.read_text())
     if args.which:
         conn["agent"] = args.which
         lab.LAB.write_text(json.dumps(conn))
-    which = conn.get("agent", "local")
-    ok(f"agent model: {lab.LAB_AGENT_MODEL} through the API (the one grading uses)" if which == "api" else
-       f"agent model: {lab.AGENT_MODEL} on this machine when lab serve runs it, else {lab.LAB_AGENT_MODEL} through the API")
+    if conn.get("agent", "api") == "api":
+        ok(f"agent model: {lab.LAB_AGENT_MODEL} through the API, the one grading uses")
+    elif lab.local_agent_model() == lab.AGENT_MODEL:
+        ok(f"agent model: {lab.AGENT_MODEL} on this machine")
+    else:
+        warn(f"agent model: {lab.AGENT_MODEL} on this machine once lab serve runs it (GPU machines); "
+             f"until then {lab.LAB_AGENT_MODEL} through the API")
 
 
 def cmd_page(args) -> None:
@@ -1663,8 +1668,7 @@ def cmd_page(args) -> None:
 
 
 def cmd_connect(args) -> None:
-    ok(f"connected as [num]{lab.connect(args.url, args.token)}[/]"
-       + (" · lab serve starts the agent model (about 4 min)" if (VENV / "bin" / "vllm").exists() else ""))
+    ok(f"connected as [num]{lab.connect(args.url, args.token)}[/]")
 
 
 # ---- vespa
@@ -1768,7 +1772,7 @@ def parser() -> argparse.ArgumentParser:
     s.set_defaults(run=cmd_serve)
     s = sub.add_parser("update", help="the newest lab code, in seconds (your edits and notebook are kept)")
     s.set_defaults(run=cmd_update)
-    s = sub.add_parser("model", help="the agent's model: local (this machine's GPU) or api (the lab's, which grading uses)")
+    s = sub.add_parser("model", help="the agent's model: api (the lab's, which grading uses; the default) or local (GPU)")
     s.add_argument("which", nargs="?", choices=("local", "api"), help="switch to it (default: say which is used)")
     s.set_defaults(run=cmd_model)
     s = sub.add_parser("page", help="a link that signs a browser in to your lab page")
