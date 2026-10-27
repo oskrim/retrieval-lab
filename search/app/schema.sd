@@ -15,7 +15,7 @@ schema dataset {
       indexing: index | summary
       index: enable-bm25
     }
-    # pplx document vectors: float, and centered sign bits packed 8 to an int8
+    # pplx document vectors: float, and sign bits packed 8 to an int8
     field dense_float type tensor<float>(x[1024]) {
       indexing: attribute
       attribute {
