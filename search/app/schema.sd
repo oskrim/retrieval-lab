@@ -102,6 +102,9 @@ schema dataset {
   #              global-phase can use firstPhase, secondPhase and normalize_linear(x)
   #
   # YOUR SEARCH ALGORITHM HERE. For now notebook 4: how many of the question's words the body contains.
+  #
+  #
+  #
   rank-profile matching inherits common {
     first-phase {
       expression: matchCount(body)
