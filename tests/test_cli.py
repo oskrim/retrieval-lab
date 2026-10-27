@@ -611,7 +611,7 @@ def test_the_agent_eval_shows_the_newest_step_any_agent_took():
     assert latest(live, seen) == "crm 3  DEALS: D0001"
     assert latest(live, seen) is None  # nothing new since
     live[0].append(dict(calls=[dict(name="read", args={"deal_id": "D0007"})], text=""))
-    assert latest(live, seen) == "crm 1  read  deal_id=D0007"
+    assert latest(live, seen) == 'crm 1  read  deal_id="D0007"'
 
 
 def latest(live, seen):
