@@ -124,14 +124,23 @@ for f in search agent.py; do
 done
 if git -C "$REPO" rev-parse -q --verify "origin/$REF" > /dev/null; then
   git -C "$REPO" checkout -q "$REF"
-  # A rewritten main is no fast-forward: move to it and put your edits back on top.
-  if ! git -C "$REPO" merge -q --ff-only --autostash "origin/$REF" 2> /dev/null; then
-    stashes=$(git -C "$REPO" stash list | wc -l)
-    git -C "$REPO" stash push -q
-    git -C "$REPO" reset -q --hard "origin/$REF"
-    if [ "$(git -C "$REPO" stash list | wc -l)" -gt "$stashes" ]; then
-      git -C "$REPO" stash pop -q || { echo "your edits conflict with the new lab: git stash show -p has them"; false; }
+  # Your edits go aside, the lab moves to the newest commit (branch lab-before-update keeps the old one), and your
+  # edits come back on top. A file the lab changed where you did stays yours; the lab's version waits beside it.
+  stashes=$(git -C "$REPO" stash list | wc -l)
+  git -C "$REPO" stash push -q
+  git -C "$REPO" branch -f lab-before-update HEAD
+  git -C "$REPO" reset -q --hard "origin/$REF"
+  if [ "$(git -C "$REPO" stash list | wc -l)" -gt "$stashes" ]; then
+    if ! git -C "$REPO" stash apply -q > /dev/null 2>&1; then
+      for f in $(git -C "$REPO" diff --name-only --diff-filter=U); do
+        mkdir -p "$(dirname "$LAB_DIR/lab-version/$f")"
+        git -C "$REPO" show "origin/$REF:$f" > "$LAB_DIR/lab-version/$f"
+        git -C "$REPO" checkout -q --theirs -- "$f"
+        echo "your $f is kept; the lab's new version of it is ~/.lab/lab-version/$f"
+      done
+      git -C "$REPO" reset -q
     fi
+    git -C "$REPO" stash drop -q
   fi
 else
   git -C "$REPO" checkout -q "$REF"
