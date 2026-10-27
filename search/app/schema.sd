@@ -95,29 +95,34 @@ schema dataset {
     }
   }
 
-  # The notebook's rankings as expressions (in first-phase, unless a phase is named; an expression is one line):
-  #   7   BM25               bm25(body)
-  #   9   two fields         bm25(body) + bm25(title)
-  #   11  saturated          saturated(bm25(body)) + saturated(bm25(title))
-  #   12  + phrases          saturated(bm25(body)) + saturated(bm25(title)) + query(phrase_weight) * phrase_share
-  #   14  vectors            cosine
-  #   15  hybrid             12's expression + query(dense_weight) * max(0, dense)
-  #   17  late interaction   second-phase { rerank-count: 30  expression: late_int8 }
-  #                          global-phase {
-  #                            rerank-count: 30
-  #                            expression: normalize_linear(firstPhase) + query(late_weight) * normalize_linear(secondPhase)
-  #                          }
-  # Also: matchCount(body), nativeRank(body), closeness(field, dense_bits); + - * / max(a, b) log(x) if(a > b, x, y).
-  # The query(...) numbers above are common's defaults; search.py's INPUTS changes them per query, without a deploy.
-  # late and late_int8 need search.py's LATE = True.
-  #
-  # YOUR SEARCH ALGORITHM HERE. For now notebook 4: how many of the question's words the body contains.
-  #
-  #
-  #
+  # The notebook's rankings as first-phase expressions:
+  # 7, BM25: bm25(body)
+  # 9, two fields: bm25(body) + bm25(title)
+  # 11, saturated: saturated(bm25(body)) + saturated(bm25(title))
+  # 12, phrases: saturated(bm25(body)) + saturated(bm25(title)) + query(phrase_weight) * phrase_share
+  # 14, vectors: cosine
+  # 15, hybrid: 12's expression + query(dense_weight) * max(0, dense)
+  # Other features: matchCount(body), nativeRank(body), closeness(field, dense_bits)
+  # Math: + - * / max(a, b) log(x) if(a > b, x, y)
+  # The query(...) numbers default to common's inputs; search.py's INPUTS overrides them per query.
+
+  # YOUR SEARCH ALGORITHM HERE
   rank-profile matching inherits common {
+
+    # Notebook 4: how many of the question's words the body contains.
     first-phase {
       expression: matchCount(body)
     }
+
+    # Notebook 17, late interaction on the best 30: uncomment both phases and set LATE = True in search.py.
+    # second-phase {
+    #   rerank-count: 30
+    #   expression: late_int8
+    # }
+
+    # global-phase {
+    #   rerank-count: 30
+    #   expression: normalize_linear(firstPhase) + query(late_weight) * normalize_linear(secondPhase)
+    # }
   }
 }
