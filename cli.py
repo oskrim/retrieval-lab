@@ -1281,7 +1281,8 @@ def cmd_setup(args) -> None:
         console.print(f"[warn]![/] {NO_GPU}")
     else:
         name, free, total = found
-        if big_gpu(found) and free < BIG_GPU_GB * 1e9 and not args.force:
+        # A running lab serve holds most of the GPU: setup run again leaves it be.
+        if big_gpu(found) and free < BIG_GPU_GB * 1e9 and not args.force and lab.local_agent_model() is None:
             raise Fail(f"{name} has {gb(free)} free of {gb(total)}; other programs use the rest. Stop them, or pass "
                        "--force to try anyway")
         ok(f"GPU  {name} · {gb(free)} free of {gb(total)}")

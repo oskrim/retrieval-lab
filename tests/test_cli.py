@@ -581,3 +581,14 @@ def test_lab_page_prints_a_login_link_and_status_says_where_an_upload_waits(conn
     assert "open within 10 minutes: https://lab.test/login/ann.1.ab" in capsys.readouterr().out
     line = cli.handin_line(dict(at=0, state="queued", position=3), str)
     assert "queued, 3rd in line" in line and [cli.ordinal(n) for n in (1, 2, 11, 12, 22)] == ["1st", "2nd", "11th", "12th", "22nd"]
+
+
+def test_setup_run_again_leaves_a_running_lab_serve_be(capsys, monkeypatch):
+    monkeypatch.setattr(cli, "gpu", lambda: ("A100", 15e9, 85e9))
+    monkeypatch.setattr(cli, "download", lambda *a: (_ for _ in ()).throw(cli.Fail("past the GPU check")))
+    monkeypatch.setattr(cli.lab, "local_agent_model", lambda: None)
+    assert cli.main(["setup"]) == 1
+    assert "other programs use the rest" in capsys.readouterr().out
+    monkeypatch.setattr(cli.lab, "local_agent_model", lambda: "nemotron")
+    assert cli.main(["setup"]) == 1
+    assert "past the GPU check" in capsys.readouterr().out
