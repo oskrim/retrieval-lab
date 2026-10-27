@@ -71,8 +71,17 @@ command -v docker > /dev/null || missing+=(docker.io)
 if [ ${#missing[@]} -gt 0 ]; then
   sudo=
   [ "$(id -u)" = 0 ] || sudo=sudo
-  # At first boot unattended-upgrades may hold the dpkg lock for a while.
-  $sudo apt-get -o DPkg::Lock::Timeout=600 update -q
+  # Right after boot, cloud-init still runs its own apt-get update (it holds the package lists' lock), and
+  # unattended-upgrades may hold the dpkg lock for a while: wait for both.
+  if command -v cloud-init > /dev/null; then
+    echo "waiting for the box's first-boot setup (cloud-init) to finish"
+    $sudo cloud-init status --wait > /dev/null 2>&1 || true
+  fi
+  for try in 1 2 3; do
+    $sudo apt-get -o DPkg::Lock::Timeout=600 update -q && break
+    [ "$try" = 3 ] && false
+    sleep 20
+  done
   DEBIAN_FRONTEND=noninteractive $sudo apt-get -o DPkg::Lock::Timeout=600 install -yq "${missing[@]}"
 fi
 
