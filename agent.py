@@ -14,11 +14,13 @@ def search(query: str) -> list[dict]:
 
 def read(deal_id: str) -> dict:
     """Read one deal in full."""
+    # lab.DEAL maps a deal id to its deal; deals also have industry, country, owner, employees, close_date, notes, ...
     return lab.DEAL.get(deal_id) or {"error": f"no deal {deal_id}"}
 
 
 def values(field: str) -> list[str]:
     """Every value of a category field (industry, country, stage, owner, product or lead_source)."""
+    # lab.find_values("fintech") finds the values behind a word instead: [{"field": "industry", "value": ...}, ...]
     return sorted({d[field] for d in lab.DEALS})
 
 
