@@ -38,7 +38,11 @@ def values(field: str) -> list[str]:
 
 
 # More in lab: matches(deal, field, want), find_values(text), find_fields(text), STAGES, CRM_TODAY, chat, tool_of.
-TOOLS = [search, read, values]
+TOOLS = [
+    search,
+    # read,
+    # values,
+]
 
 
 def answer(question: str) -> set[str]:

@@ -109,9 +109,29 @@ schema dataset {
   # YOUR SEARCH ALGORITHM HERE
   rank-profile hybrid inherits common {
 
-    # Notebook 15: saturated BM25 of both fields, phrases, and the question against the documents' sign bits.
+    # Notebook 11: saturated BM25 of both fields.
+    function lexical() {
+      expression: saturated(bm25(body)) + saturated(bm25(title))
+    }
+
+    # Notebook 12: the share of the question's word pairs found as phrases.
+    function phrases() {
+      expression: query(phrase_weight) * phrase_share
+    }
+
+    # Notebook 15: the question's vector against the documents' sign bits.
+    function vectors() {
+      expression: query(dense_weight) * max(0, dense)
+    }
+
+    # Notebook 15's hybrid; a # in front of a line leaves that part out.
     first-phase {
-      expression: saturated(bm25(body)) + saturated(bm25(title)) + query(phrase_weight) * phrase_share + query(dense_weight) * max(0, dense)
+      expression {
+        0
+        + lexical
+        + phrases
+        + vectors
+      }
     }
 
     # Notebook 17, late interaction on the best 30: uncomment both phases.
