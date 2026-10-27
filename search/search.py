@@ -11,7 +11,7 @@ and app/.
 
 As it is, the query finds the documents with any of the question's words or synonym phrases (synonyms.json's groups as
 equiv terms) or among the nearest by vector, sends the question's word pairs as phrases and its vector, and Vespa ranks
-them with notebook 15's hybrid (late interaction waits commented out). app/schema.sd's common profile has the
+them by saturated BM25 (the hybrid's other parts wait commented out). app/schema.sd's common profile has the
 notebook's pieces as functions (saturated BM25, the phrase share, cosine, the bits, late interaction); a profile of
 your own combines them. Things to try:
 - PROFILE: your profile; INPUTS: its query(...) inputs, per query, without a deploy. query(saturation), for one:

@@ -124,13 +124,13 @@ schema dataset {
       expression: query(dense_weight) * max(0, dense)
     }
 
-    # Notebook 15's hybrid; a # in front of a line leaves that part out.
+    # Notebook 11 for now; remove a # to add notebook 12's phrases and 15's vectors (the hybrid).
     first-phase {
       expression {
         0
         + lexical
-        + phrases
-        + vectors
+        # + phrases
+        # + vectors
       }
     }
 
