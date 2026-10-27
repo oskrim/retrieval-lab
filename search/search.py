@@ -30,6 +30,8 @@ search must return k distinct document rows (indices into ds.ids), best first.
 """
 
 import json
+import pathlib
+import re
 
 import numpy as np
 
@@ -39,7 +41,6 @@ import labvespa
 
 PROFILE = "hybrid"
 INPUTS = {}
-LATE = False  # send the question's late-interaction tokens (query(qlate_float), query(qlate_bits)) that late uses
 TARGET_HITS = 100  # how many documents nearestNeighbor finds
 WORDS_ONLY: set[str] = set()  # profiles that match only the question's words; dense-* match only by vector
 NEAREST: dict[str, tuple[str, str]] = {}  # profile -> (field, input) its nearestNeighbor uses; others: the bits
@@ -100,10 +101,23 @@ def search(ds: lab.Dataset, question: str, k: int = 10) -> np.ndarray:
     q = known[question] if question in known else lab.embed([question])[0]  # the question's unit pplx vector
     inputs = {"query(q)": q, "query(qc)": q - mean, "query(qbits)": lab.pack_signs(q - mean >= 0).view(np.int8),
               "query(pair_count)": len(pairs), **INPUTS}
-    if LATE:
+    if uses_late(PROFILE):
         inputs.update(labvespa.late_inputs(ds, question))
     hits = labvespa.query(ds.name, yql(ds, question, terms, pairs), PROFILE, inputs, hits=k * HITS_PER_POST)
     return np.array([ds.row[d] for d, _ in best_chunks(hits)], dtype=np.int64)[:k]
+
+
+def uses_late(profile: str) -> bool:
+    """Whether app/schema.sd's profile calls late or late_int8 outside comments: then each query sends the question's
+    late-interaction tokens (query(qlate_float), query(qlate_bits)), which a new question takes seconds to encode."""
+    if profile not in _LATE:
+        schema = (pathlib.Path(__file__).parent / "app" / "schema.sd").read_text()
+        body = re.split(r"\n\s*rank-profile\s", schema.split(f"rank-profile {profile} ", 1)[-1])[0]
+        _LATE[profile] = bool(re.search(r"\blate(_int8)?\b", re.sub(r"#.*", "", body)))
+    return _LATE[profile]
+
+
+_LATE: dict[str, bool] = {}
 
 
 def best_chunks(hits: list[tuple[str, float]]) -> list[tuple[str, float]]:

@@ -394,3 +394,15 @@ def test_sync_deploys_a_changed_app_and_sends_a_changed_document_to_lab_vespa_up
 
 def test_the_search_folder_starts_with_the_lab_synonyms():
     assert json.loads((labvespa.LAB_FOLDER / "synonyms.json").read_text())["groups"] == labvespa.lab.synonyms()
+
+
+def test_the_template_search_sends_late_tokens_only_to_a_profile_that_uses_them(tmp_path, monkeypatch):
+    search = vespa_search()
+    assert search.uses_late("hybrid") is False  # its late phases wait commented out
+    schema = tmp_path / "app" / "schema.sd"
+    schema.parent.mkdir()
+    schema.write_text("rank-profile a inherits common {\n  # late_int8 in a comment\n}\n"
+                      "rank-profile b inherits common {\n  second-phase { expression: late_int8 }\n}\n")
+    monkeypatch.setattr(search, "__file__", str(tmp_path / "search.py"))
+    search._LATE.clear()
+    assert search.uses_late("a") is False and search.uses_late("b") is True

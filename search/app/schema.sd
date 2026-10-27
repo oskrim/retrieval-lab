@@ -114,7 +114,7 @@ schema dataset {
       expression: saturated(bm25(body)) + saturated(bm25(title)) + query(phrase_weight) * phrase_share + query(dense_weight) * max(0, dense)
     }
 
-    # Notebook 17, late interaction on the best 30: uncomment both phases and set LATE = True in search.py.
+    # Notebook 17, late interaction on the best 30: uncomment both phases.
     # second-phase {
     #   rerank-count: 30
     #   expression: late_int8
