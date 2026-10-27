@@ -25,7 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -395,6 +395,29 @@ class QuietProgress(Progress):
         self.live.stop()
 
 
+class AgentProgress(QuietProgress):
+    """The progress bar with one line under it: the latest step any running agent took (now)."""
+
+    now = Text("waiting for the model", "dim")
+
+    def get_renderables(self):
+        yield self.make_tasks_table(self.tasks)
+        yield self.now
+
+
+def latest_step(live: dict[int, list[dict]], seen: dict[int, int], short: str) -> Text | None:
+    """The newest step among the running agents' traces (live: question index -> its turns, filling as it runs), as
+    "crm 3  search  country=Finland …"; None when none took a step since the last look (seen: turns already shown)."""
+    for i, turns in list(live.items()):
+        if len(turns) > seen.get(i, 0):
+            seen[i] = len(turns)
+            turn = turns[-1]
+            call = turn["calls"][-1] if turn["calls"] else None
+            what = Text.assemble((call["name"], "acc"), "  ", args_text(call["args"])) if call else Text(turn["text"] or "answers")
+            return Text.assemble((f"{short} {i + 1}  ", "dim"), what)
+    return None
+
+
 def progress(*extra) -> Progress:
     return QuietProgress(SpinnerColumn(style="acc"), TextColumn("{task.description}"), BarColumn(complete_style="acc"), *extra,
                     TimeElapsedColumn(), console=console, transient=True)
@@ -528,14 +551,34 @@ def eval_agent(path: pathlib.Path, module, worst: int) -> None:
     found: dict[int, set[str]] = {}
     traces: dict[int, list[dict]] = {}
     run = time.time()
+    live: dict[int, list[dict]] = {}  # each running question's turns, filled as its agent works
+
+    def one(i: int, question: str) -> tuple[set[str], list[dict]]:
+        with lab.tracing() as turns:
+            live[i] = turns
+            try:
+                return answer(question), turns
+            finally:
+                live.pop(i, None)
+
     pool = ThreadPoolExecutor(lab.AGENT_THREADS)
     try:
-        with progress(MofNCompleteColumn()) as bar:
+        bar = AgentProgress(SpinnerColumn(style="acc"), TextColumn("{task.description}"), BarColumn(complete_style="acc"),
+                            MofNCompleteColumn(), TimeElapsedColumn(), console=console, transient=True)
+        with bar:
             task = bar.add_task(AGENT_SET, total=len(questions))
-            futures = {pool.submit(traced, answer, q): i for i, (q, _) in enumerate(questions)}
-            for f in as_completed(futures):
-                found[futures[f]], traces[futures[f]] = f.result()
-                bar.advance(task)
+            futures = {pool.submit(one, i, q): i for i, (q, _) in enumerate(questions)}
+            seen: dict[int, int] = {}
+            pending = set(futures)
+            while pending:
+                done, pending = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
+                for f in done:
+                    found[futures[f]], traces[futures[f]] = f.result()
+                    bar.advance(task)
+                step = latest_step(live, seen, DATASET_SHORT[AGENT_SET])
+                if step is not None:
+                    step.truncate(console.width - 1, overflow="ellipsis")
+                    bar.now = step
     finally:
         pool.shutdown(wait=False, cancel_futures=True)  # an error or Ctrl-C does not wait for the running agents
     elapsed = time.time() - run

@@ -601,3 +601,19 @@ def test_lab_update_runs_only_the_setup_scripts_clone_step(connected, monkeypatc
     assert cli.main(["update"]) == 0
     saved = json.loads(cli.lab.LAB.read_text())
     assert ran == [(["bash", "-c", 'curl -fsSL "$LAB_URL/setup" | bash'], saved["url"], "base")]
+
+
+def test_the_agent_eval_shows_the_newest_step_any_agent_took():
+    live = {0: [dict(calls=[dict(name="search", args={"query": "x", "filters": {"country": "Finland"}})], text="")],
+            2: [dict(calls=[], text="DEALS: D0001")]}
+    seen = {}
+    assert latest(live, seen) == 'crm 1  search  query="x" filters={country: Finland}'
+    assert latest(live, seen) == "crm 3  DEALS: D0001"
+    assert latest(live, seen) is None  # nothing new since
+    live[0].append(dict(calls=[dict(name="read", args={"deal_id": "D0007"})], text=""))
+    assert latest(live, seen) == "crm 1  read  deal_id=D0007"
+
+
+def latest(live, seen):
+    step = cli.latest_step(live, seen, "crm")
+    return None if step is None else step.plain
