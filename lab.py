@@ -1533,7 +1533,24 @@ def embed(texts: list[str]) -> np.ndarray:
         return np.zeros((0, 1024), dtype=np.float32)
     if not all(t.strip() for t in texts):
         raise ValueError("cannot embed an empty text")
-    return _pplx(list(texts), 512)
+    with _EMBED_LOCK:
+        (DATA / "cache").mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(DATA / "cache" / "embed.sqlite")
+        try:
+            db.execute("CREATE TABLE IF NOT EXISTS vecs (text TEXT PRIMARY KEY, vec BLOB NOT NULL)")
+            known = {t: np.frombuffer(v, dtype=np.float32) for t, v in db.execute(
+                f"SELECT text, vec FROM vecs WHERE text IN ({','.join('?' * len(texts))})", list(texts))}
+            new = list(dict.fromkeys(t for t in texts if t not in known))
+            if new:
+                known.update(zip(new, np.asarray(_pplx(new, 512), dtype=np.float32)))
+                with db:
+                    db.executemany("INSERT OR REPLACE INTO vecs VALUES (?, ?)", [(t, known[t].tobytes()) for t in new])
+        finally:
+            db.close()
+    return np.stack([known[t] for t in texts])
+
+
+_EMBED_LOCK = threading.Lock()  # embed's cache of every text it embedded: a question asked again skips the model
 
 
 def embed_documents(texts: list[str]) -> np.ndarray:

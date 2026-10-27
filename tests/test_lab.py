@@ -402,3 +402,13 @@ def test_submit_sends_the_dev_score_to_the_live_board(monkeypatch):
     monkeypatch.setattr(lab, "crm_dev", lambda: [("x?", {"D1"}), ("y?", set())])
     assert lab.submit_agent(lambda q: {"D1"}, "agent") == dict(score=0.5, rank=1, of=1)
     assert sent[-1] == ("/api/agent-board", dict(label="agent", scores={"crm dev": 0.5}))
+
+
+def test_embed_keeps_every_vector_so_a_text_asked_again_skips_the_model(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(lab, "DATA", tmp_path)
+    monkeypatch.setattr(lab, "_pplx", lambda texts, window: calls.append(list(texts)) or np.ones((len(texts), 4)) * len(calls))
+    first = lab.embed(["a", "b"])
+    again = lab.embed(["b", "c", "a"])
+    assert calls == [["a", "b"], ["c"]]
+    assert first.dtype == np.float32 and np.array_equal(again[0], first[1]) and np.array_equal(again[2], first[0])
