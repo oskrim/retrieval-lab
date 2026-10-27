@@ -411,11 +411,14 @@ def latest_step(live: dict[int, list[dict]], seen: dict[int, int], short: str) -
     for i, turns in list(live.items()):
         if len(turns) > seen.get(i, 0):
             seen[i] = len(turns)
-            turn = turns[-1]
-            call = turn["calls"][-1] if turn["calls"] else None
-            what = Text.assemble((call["name"], "acc"), "  ", args_text(call["args"])) if call else Text(turn["text"] or "answers")
-            return Text.assemble((f"{short} {i + 1}  ", "dim"), what)
+            return Text.assemble((f"{short} {i + 1}  ", "dim"), step_text(turns[-1]))
     return None
+
+
+def step_text(turn: dict) -> Text:
+    """A turn as one status line: its last tool call and arguments, else the text the model wrote."""
+    call = turn["calls"][-1] if turn["calls"] else None
+    return Text.assemble((call["name"], "acc"), "  ", args_text(call["args"])) if call else Text(turn["text"] or "answers")
 
 
 def progress(*extra) -> Progress:
@@ -930,12 +933,6 @@ def drill_agent(a: dict, b: dict, label: str, n: int, qa: dict, qb: dict) -> Non
 
 # ---- trace: one agent question's trajectory, recorded by lab eval agent
 
-def traced(answer, question: str) -> tuple[set[str], list[dict]]:
-    """answer(question), with every lab.chat call it makes in this thread recorded as a turn (lab.tracing)."""
-    with lab.tracing() as turns:
-        return answer(question), turns
-
-
 def trace_totals(trace: list[dict]) -> str:
     """"3 turns · 6,210 tokens · $0.004"; tokens and cost when the model reported them."""
     tokens = [t["tokens"] for t in trace if t["tokens"] is not None]
@@ -1134,8 +1131,29 @@ DEAL_FIELDS = ("company", "stage", "country")
 
 def query_agent(path: pathlib.Path, module, question: str) -> None:
     start = time.time()
-    with console.status("the agent is working"):
-        found, trace = traced(checked_answer(module, path), question)
+    answer, live, result = checked_answer(module, path), [], {}
+
+    def run() -> None:
+        with lab.tracing() as turns:
+            live.append(turns)
+            try:
+                result["found"] = answer(question)
+            except BaseException as e:  # re-raised below, in the CLI's thread
+                result["error"] = e
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    with console.status("asking the model") as status:
+        shown = 0
+        while worker.is_alive():
+            worker.join(0.25)
+            turns = live[0] if live else []
+            if len(turns) > shown:
+                shown = len(turns)
+                status.update(Text.assemble((f"turn {shown}  ", "dim"), step_text(turns[-1])))
+    if "error" in result:
+        raise result["error"]
+    found, trace = result["found"], live[0]
     console.print(Text.assemble((file_key(str(path)), "bold"), f" · {trace_totals(trace)} · {time.time() - start:.1f} s"))
     q = dict(trace=trace, top=sorted(found), expected=[])
     for line in trace_lines(q, None, console.width, outcome=False):
