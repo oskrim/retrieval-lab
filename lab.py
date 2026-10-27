@@ -768,7 +768,8 @@ def connect(url: str, token: str) -> str:
         raise
     except (ValueError, KeyError, TypeError):
         raise RuntimeError(f"{url} did not answer as a lab; copy the URL from your lab page") from None
-    LAB.write_text(json.dumps(dict(url=url, token=token.strip(), tz=me.get("tz"))))
+    kept = {k: v for k, v in (json.loads(LAB.read_text()) if LAB.exists() else {}).items() if k == "agent"}  # lab model
+    LAB.write_text(json.dumps(dict(kept, url=url, token=token.strip(), tz=me.get("tz"))))
     return nick
 
 
@@ -810,16 +811,19 @@ _AGENT_LOCK = threading.Lock()
 
 def agent_endpoint() -> tuple[str, dict[str, str], str]:
     """Where chat sends its messages, chosen once per process and said in one line: the local vLLM when it serves
-    AGENT_MODEL, else the lab server's model (LAB_AGENT_MODEL, within your budget there)."""
+    AGENT_MODEL, else the lab server's model (LAB_AGENT_MODEL, within your budget there); lab model api picks the
+    lab's model even when the local one runs (grading uses the lab's)."""
     with _AGENT_LOCK:
         if not _AGENT:
-            if local_agent_model() == AGENT_MODEL:
+            api = LAB.exists() and json.loads(LAB.read_text()).get("agent") == "api"
+            if not api and local_agent_model() == AGENT_MODEL:
                 _AGENT.append((f"{VLLM_URL}/chat/completions", {}, AGENT_MODEL))
                 print(f"agent model: {AGENT_MODEL} on this machine", file=sys.stderr)
             elif LAB.exists():
                 lab = json.loads(LAB.read_text())
                 _AGENT.append((f"{lab['url']}/v1/chat/completions", {"Authorization": f"Bearer {lab['token']}"}, LAB_AGENT_MODEL))
-                print(f"agent model: {LAB_AGENT_MODEL} through the API ({AGENT_MODEL} is not running here)", file=sys.stderr)
+                why = "lab model api" if api else f"{AGENT_MODEL} is not running here"
+                print(f"agent model: {LAB_AGENT_MODEL} through the API ({why})", file=sys.stderr)
             else:
                 raise RuntimeError("no agent model: start one with lab serve (GPU), or connect to the lab with lab connect")
         return _AGENT[0]

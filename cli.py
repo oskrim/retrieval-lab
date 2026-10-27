@@ -18,6 +18,7 @@ import signal
 import subprocess
 import sys
 import tarfile
+import textwrap
 import threading
 import time
 import traceback
@@ -996,10 +997,11 @@ def first_difference(qa: dict, qb: dict) -> int | None:
     return None if qa["top"] == qb["top"] else len(sa)
 
 
-def trace_lines(q: dict, mark: int | None, width: int, outcome: bool = True) -> list[Text]:
+def trace_lines(q: dict, mark: int | None, width: int, outcome: bool = True, full: bool = False) -> list[Text]:
     """The trajectory, one line per tool call: turn, tool, arguments → what it returned, and the text the model wrote;
     then its answer and, with outcome, the deals expected, missing and extra. mark: the tool call (counted over the
-    whole trace; len(calls) is the answer) that a › marks."""
+    whole trace; len(calls) is the answer) that a › marks. full: arguments and the model's text whole, wrapped, and a
+    result that does not fit beside its arguments on a line of its own (else everything cut to one line each)."""
     trace, got, expected = q["trace"], sorted(q["top"]), sorted(q["expected"])
     num_w = len(str(len(trace)))
     name_w = max([len("answer"), *(len(c["name"]) for t in trace for c in t["calls"])])
@@ -1011,6 +1013,13 @@ def trace_lines(q: dict, mark: int | None, width: int, outcome: bool = True) -> 
     def add(turn: str, name: str, body: Text, marked: bool = False) -> None:
         lines.append(Text.assemble(("›" if marked else " ", "warn"), " ", f"{turn:>{num_w}}  {name:<{name_w}}  ", body))
 
+    def answer_lines(turn: str, marked: bool) -> None:
+        """The answer's deal ids: whole and wrapped with full, else cut to one line."""
+        ids = " ".join(got) or "none"
+        first, *more = textwrap.wrap(ids, rest) if full else [cut(ids, rest)]
+        add(turn, "answer", Text(first), marked)
+        lines.extend(Text(" " * lead + row) for row in more)
+
     k = 0
     if not trace:
         lines.append(Text("  no lab.chat calls recorded", "dim"))
@@ -1018,16 +1027,31 @@ def trace_lines(q: dict, mark: int | None, width: int, outcome: bool = True) -> 
         turn = str(n)
         for c in t["calls"]:
             result = c["result"]
-            add(turn, c["name"], Text.assemble(cut(args_text(c["args"]), arg_w).ljust(arg_w), "  → ",
-                                               (cut(result, rest - arg_w - 4), "") if result else ("–", "dim")), k == mark)
+            if full:
+                args = args_text(c["args"])
+                if len(args) + 4 + len(result or "–") <= rest:  # all on the tool's line
+                    add(turn, c["name"], Text.assemble(args, "  → ", (result, "") if result else ("–", "dim")), k == mark)
+                else:  # the arguments whole, wrapped; the result (often a list) cut to one line under them
+                    first, *more = textwrap.wrap(args, rest) or [""]
+                    add(turn, c["name"], Text(first), k == mark)
+                    lines += [Text(" " * lead + row) for row in more]
+                    lines.append(Text.assemble(" " * lead, "→ ", (cut(result, rest - 2), "") if result else ("–", "dim")))
+            else:
+                add(turn, c["name"], Text.assemble(cut(args_text(c["args"]), arg_w).ljust(arg_w), "  → ",
+                                                   (cut(result, rest - arg_w - 4), "") if result else ("–", "dim")), k == mark)
             turn, k = "", k + 1
         if n == len(trace) and not t["calls"]:
-            add(turn, "answer", Text(" ".join(got) or "none"), k == mark)
+            answer_lines(turn, k == mark)
             turn = ""
-        if t["text"]:
+        if t["text"] and full:
+            first, *more = textwrap.wrap(t["text"], rest) or [""]
+            add(turn, "says", Text(first, "dim"))
+            for row in more:
+                lines.append(Text.assemble(" " * lead, (row, "dim")))
+        elif t["text"]:
             add(turn, "says", Text(cut(t["text"], rest), "dim"))
     if not trace or trace[-1]["calls"]:
-        add("", "answer", Text(" ".join(got) or "none"), k == mark)
+        answer_lines("", k == mark)
     if outcome:
         pad = " " * (lead - 2 - len("expected"))
         lines.append(Text.assemble(("  expected", "dim"), pad, " ".join(expected) or "none"))
@@ -1060,7 +1084,7 @@ def cmd_trace(args) -> None:
     console.print(Text.assemble((f"{DATASET_SHORT[label]} {n}", "bold"), "  ", (run["name"], "me"), " · ", verdict(q),
                                 (f" · {trace_totals(q['trace'])}", "dim")))
     console.print(Text("  " + " ".join(q["text"].split())))
-    for line in trace_lines(q, None, console.width):
+    for line in trace_lines(q, None, console.width, full=True):
         console.print(line, no_wrap=True, overflow="ellipsis")
 
 
@@ -1156,7 +1180,7 @@ def query_agent(path: pathlib.Path, module, question: str) -> None:
     found, trace = result["found"], live[0]
     console.print(Text.assemble((file_key(str(path)), "bold"), f" · {trace_totals(trace)} · {time.time() - start:.1f} s"))
     q = dict(trace=trace, top=sorted(found), expected=[])
-    for line in trace_lines(q, None, console.width, outcome=False):
+    for line in trace_lines(q, None, console.width, outcome=False, full=True):
         console.print(line, no_wrap=True, overflow="ellipsis")
     deals = {d["deal_id"]: d for d in lab.crm()}
     table = Table(box=None, show_header=False, padding=(0, 2, 0, 0))
@@ -1571,9 +1595,7 @@ def cmd_status(args) -> None:
     grid.add_row("lab", conn)
     for kind, handin, show in handins:
         if handin is not None:
-            line = Text.from_markup(handin_line(handin, show), overflow="ellipsis")
-            line.no_wrap = True  # a failure's reason in full, cut at the terminal's width
-            grid.add_row(f"{kind} upload", line)
+            grid.add_row(f"{kind} upload", Text.from_markup(handin_line(handin, show)))  # a failure's reason wraps, whole
     grid.add_row("data", f"{lab.DATA_VERSION} [ok]✓[/]" if data else "[err]missing[/] · lab setup")
     grid.add_row("models", models)
     grid.add_row("reranker scores", f"{lab.rerank_cache_name()} " + ("[ok]✓[/]" if scores else "[err]✗[/] · lab setup"))
@@ -1616,6 +1638,20 @@ def cmd_update(args) -> None:
         raise Fail("not connected to the lab; run the setup line from your lab page")
     env = dict(os.environ, LAB_URL=json.loads(lab.LAB.read_text())["url"], LAB_SETUP_STEPS="base")
     os.execvpe("bash", ["bash", "-c", 'curl -fsSL "$LAB_URL/setup" | bash'], env)
+
+
+def cmd_model(args) -> None:
+    """Which model lab eval and lab query run the agent on: local (the GPU's, when lab serve runs it) or api (the lab's,
+    which grading uses)."""
+    if not lab.LAB.exists():
+        raise Fail("not connected to the lab; run the setup line from your lab page")
+    conn = json.loads(lab.LAB.read_text())
+    if args.which:
+        conn["agent"] = args.which
+        lab.LAB.write_text(json.dumps(conn))
+    which = conn.get("agent", "local")
+    ok(f"agent model: {lab.LAB_AGENT_MODEL} through the API (the one grading uses)" if which == "api" else
+       f"agent model: {lab.AGENT_MODEL} on this machine when lab serve runs it, else {lab.LAB_AGENT_MODEL} through the API")
 
 
 def cmd_page(args) -> None:
@@ -1732,6 +1768,9 @@ def parser() -> argparse.ArgumentParser:
     s.set_defaults(run=cmd_serve)
     s = sub.add_parser("update", help="the newest lab code, in seconds (your edits and notebook are kept)")
     s.set_defaults(run=cmd_update)
+    s = sub.add_parser("model", help="the agent's model: local (this machine's GPU) or api (the lab's, which grading uses)")
+    s.add_argument("which", nargs="?", choices=("local", "api"), help="switch to it (default: say which is used)")
+    s.set_defaults(run=cmd_model)
     s = sub.add_parser("page", help="a link that signs a browser in to your lab page")
     s.set_defaults(run=cmd_page)
     s = sub.add_parser("status", help="GPU, vLLM, lab connection, data and models")

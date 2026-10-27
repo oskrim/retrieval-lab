@@ -500,11 +500,11 @@ def test_status_lists_the_latest_uploads_and_why_one_failed(tmp_path, monkeypatc
     cli.cmd_status(None)
     assert re.search(r"│ search upload +10:07", (out := capsys.readouterr().out)) and "agent upload" not in out  # no upload, no row
     assert json.loads(cli.lab.LAB.read_text())["tz"] == "UTC"  # the lab's time zone, saved for the times shown
-    replies["/api/handin"]["handin"]["error"] = "agent failed: ModelError: " + "x" * 300
+    replies["/api/handin"]["handin"]["error"] = "agent failed: ModelError: " + "word " * 60
     cli.cmd_status(None)
     out = capsys.readouterr().out.splitlines()
     row = next(i for i, line in enumerate(out) if "search upload" in line)
-    assert out[row].rstrip().endswith("… │") and cell_len(out[row]) <= 80 and "xxx" not in out[row + 1]  # one line
+    assert cell_len(out[row]) <= 80 and "word" in out[row + 1] and "…" not in "".join(out)  # wrapped, whole
 
 
 def test_eval_search_syncs_vespa_with_its_folder_first(tmp_path, evals, capsys, monkeypatch):
@@ -617,3 +617,15 @@ def test_the_agent_eval_shows_the_newest_step_any_agent_took():
 def latest(live, seen):
     step = cli.latest_step(live, seen, "crm")
     return None if step is None else step.plain
+
+
+def test_lab_model_switches_the_agent_between_the_local_model_and_the_api(connected, capsys, monkeypatch):
+    monkeypatch.setattr(cli.lab, "local_agent_model", lambda: cli.lab.AGENT_MODEL)
+    monkeypatch.setattr(cli.lab, "_AGENT", [])
+    assert cli.lab.agent_endpoint()[2] == cli.lab.AGENT_MODEL  # the local one, when it runs
+    assert cli.main(["model", "api"]) == 0 and "the one grading uses" in capsys.readouterr().out
+    monkeypatch.setattr(cli.lab, "_AGENT", [])
+    assert cli.lab.agent_endpoint()[2] == cli.lab.LAB_AGENT_MODEL
+    assert cli.main(["model", "local"]) == 0 and cli.main(["model"]) == 0
+    monkeypatch.setattr(cli.lab, "_AGENT", [])
+    assert cli.lab.agent_endpoint()[2] == cli.lab.AGENT_MODEL
