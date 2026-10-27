@@ -426,12 +426,13 @@ def when(at: float) -> str:
 
 def result_table(path: pathlib.Path, metric: str, results: list[Result], elapsed: float, caption: str = "") -> Table:
     """This run's score on each dataset, with its 95% interval."""
-    table = Table(title=f"{file_key(str(path))} · {metric} · {elapsed:.1f} s", title_justify="left", title_style="bold",
-                  box=None, padding=(0, 1), caption=caption or None, caption_style="dim", caption_justify="left")
-    for header, justify in (("dataset", "left"), (metric, "right"), ("95% interval", "right")):
+    title = f"{file_key(str(path))} · {metric} · {elapsed:.1f} s"
+    table = Table(title=title, title_justify="left", title_style="bold", box=None, padding=(0, 1), min_width=len(title),
+                  caption=caption or None, caption_style="dim", caption_justify="left")
+    for header, justify in (("dataset", "left"), (metric, "right"), ("", "left")):
         table.add_column(header, justify=justify, header_style="dim", no_wrap=True)
     for r in results:
-        table.add_row(r.dataset, Text(f"{r.score:.3f}", "num"), f"{r.lo:.3f}–{r.hi:.3f}")
+        table.add_row(r.dataset, Text(f"{r.score:.3f}", "num"), Text(f"[{r.lo:.3f}, {r.hi:.3f}]", "dim"))
     return table
 
 
