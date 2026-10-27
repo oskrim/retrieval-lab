@@ -64,8 +64,11 @@ schema dataset {
       query(qbits) tensor<int8>(x[128])
       query(qlate_bits) tensor<int8>(qt{}, x[16])
       query(qlate_float) tensor<float>(qt{}, x[128])
-      query(saturation): 25.0
       query(pair_count): 0.0
+      query(saturation): 25.0  # notebook 11's κ
+      query(phrase_weight): 0.2  # notebook 12
+      query(dense_weight): 4.0  # notebook 15
+      query(late_weight): 2.0  # notebook 17's λ
     }
     # notebook 11
     function saturated(x) {
@@ -92,14 +95,21 @@ schema dataset {
     }
   }
 
-  # What a rank expression can use:
-  #   common     saturated(x), phrase_share, cosine, dense, late, late_int8
-  #   text       bm25(title), bm25(body), matchCount(body), nativeRank(body)
-  #   vectors    closeness(field, dense_bits), attribute(dense_float)
-  #   inputs     query(name), declared under inputs and sent in search.py's INPUTS
-  #   math       + - * /, max(a, b), log(x), pow(x, y), if(a > b, x, y)
-  #   phases     first-phase scores every match; second-phase and global-phase { rerank-count: N ... } the best N;
-  #              global-phase can use firstPhase, secondPhase and normalize_linear(x)
+  # The notebook's rankings as expressions (in first-phase, unless a phase is named; an expression is one line):
+  #   7   BM25               bm25(body)
+  #   9   two fields         bm25(body) + bm25(title)
+  #   11  saturated          saturated(bm25(body)) + saturated(bm25(title))
+  #   12  + phrases          saturated(bm25(body)) + saturated(bm25(title)) + query(phrase_weight) * phrase_share
+  #   14  vectors            cosine
+  #   15  hybrid             12's expression + query(dense_weight) * max(0, dense)
+  #   17  late interaction   second-phase { rerank-count: 30  expression: late_int8 }
+  #                          global-phase {
+  #                            rerank-count: 30
+  #                            expression: normalize_linear(firstPhase) + query(late_weight) * normalize_linear(secondPhase)
+  #                          }
+  # Also: matchCount(body), nativeRank(body), closeness(field, dense_bits); + - * / max(a, b) log(x) if(a > b, x, y).
+  # The query(...) numbers above are common's defaults; search.py's INPUTS changes them per query, without a deploy.
+  # late and late_int8 need search.py's LATE = True.
   #
   # YOUR SEARCH ALGORITHM HERE. For now notebook 4: how many of the question's words the body contains.
   #
