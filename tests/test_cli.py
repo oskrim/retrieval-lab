@@ -592,3 +592,11 @@ def test_setup_run_again_leaves_a_running_lab_serve_be(capsys, monkeypatch):
     monkeypatch.setattr(cli.lab, "local_agent_model", lambda: "nemotron")
     assert cli.main(["setup"]) == 1
     assert "past the GPU check" in capsys.readouterr().out
+
+
+def test_lab_update_runs_only_the_setup_scripts_clone_step(connected, monkeypatch):
+    ran = []
+    monkeypatch.setattr(cli.os, "execvpe", lambda file, args, env: ran.append((args, env["LAB_URL"], env["LAB_SETUP_STEPS"])))
+    assert cli.main(["update"]) == 0
+    saved = json.loads(cli.lab.LAB.read_text())
+    assert ran == [(["bash", "-c", 'curl -fsSL "$LAB_URL/setup" | bash'], saved["url"], "base")]

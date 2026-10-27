@@ -78,7 +78,7 @@ fi
 
 begin gpu
 # The agent model, the reranker, vLLM and Vespa's data take about 90 GB beside the OS; Vespa stops feeding at 95% full.
-if command -v nvidia-smi > /dev/null && nvidia-smi -L > /dev/null 2>&1; then
+if [ "$STEPS" = all ] && command -v nvidia-smi > /dev/null && nvidia-smi -L > /dev/null 2>&1; then
   rm -rf "$HOME/.cache/pip"
   disk_gb=$(df -BG --output=size / | tail -n 1 | tr -dc 0-9)
   [ "$disk_gb" -ge 190 ] || { echo "disk ${disk_gb} GB, a GPU box needs 200 · delete this box, create one with a 200 GB disk"; false; }

@@ -1522,6 +1522,14 @@ def budget_left(me: dict) -> str:
 
 # ---- connect, new
 
+def cmd_update(args) -> None:
+    """The newest lab code: the setup script's clone step only (your edits and notebook are kept), in seconds."""
+    if not lab.LAB.exists():
+        raise Fail("not connected to the lab; run the setup line from your lab page")
+    env = dict(os.environ, LAB_URL=json.loads(lab.LAB.read_text())["url"], LAB_SETUP_STEPS="base")
+    os.execvpe("bash", ["bash", "-c", 'curl -fsSL "$LAB_URL/setup" | bash'], env)
+
+
 def cmd_page(args) -> None:
     """A link that signs a browser in to your lab page: a new browser, or one that lost its login."""
     if not lab.LAB.exists():
@@ -1634,6 +1642,8 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--stop", action="store_true", help="stop it")
     s.add_argument("--timeout", type=int, default=900, help="seconds to wait for it (default 900)")
     s.set_defaults(run=cmd_serve)
+    s = sub.add_parser("update", help="the newest lab code, in seconds (your edits and notebook are kept)")
+    s.set_defaults(run=cmd_update)
     s = sub.add_parser("page", help="a link that signs a browser in to your lab page")
     s.set_defaults(run=cmd_page)
     s = sub.add_parser("status", help="GPU, vLLM, lab connection, data and models")
