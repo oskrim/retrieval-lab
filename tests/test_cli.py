@@ -573,3 +573,11 @@ def test_search_evals_refuse_the_reranker(tmp_path, capsys, monkeypatch):
     assert cli.main(["eval", str(path)]) == 1
     assert "the reranker is not part of the graded search" in " ".join(capsys.readouterr().out.split())
     assert cli.lab.RERANKER_OFF == ""
+
+
+def test_lab_page_prints_a_login_link_and_status_says_where_an_upload_waits(connected, capsys, monkeypatch):
+    monkeypatch.setattr(cli.lab, "call", lambda path, body: dict(url="https://lab.test/login/ann.1.ab", minutes=10))
+    assert cli.main(["page"]) == 0
+    assert "open within 10 minutes: https://lab.test/login/ann.1.ab" in capsys.readouterr().out
+    line = cli.handin_line(dict(at=0, state="queued", position=3), str)
+    assert "queued, 3rd in line" in line and [cli.ordinal(n) for n in (1, 2, 11, 12, 22)] == ["1st", "2nd", "11th", "12th", "22nd"]

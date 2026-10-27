@@ -1499,7 +1499,13 @@ def handin_line(h: dict, show) -> str:
         return f"{at} · [ok]graded[/]{preview}" + ("" if h["score"] is None else f" · hidden [num]{show(h['score'])}[/]")
     if h["state"] == "failed":
         return f"{at} · [err]failed[/]: {escape(h['error'] or '')}"
+    if h["state"] == "queued" and h.get("position"):
+        return f"{at} · queued, {ordinal(h['position'])} in line"
     return f"{at} · {h['state']}"
+
+
+def ordinal(n: int) -> str:
+    return f"{n}{'th' if 11 <= n % 100 <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
 
 
 def budget_left(me: dict) -> str:
@@ -1513,6 +1519,14 @@ def budget_left(me: dict) -> str:
 
 
 # ---- connect, new
+
+def cmd_page(args) -> None:
+    """A link that signs a browser in to your lab page: a new browser, or one that lost its login."""
+    if not lab.LAB.exists():
+        raise Fail("not connected to the lab; run the setup line from your lab page")
+    link = lab.call("/api/login-link", {})
+    console.print(f"open within {link['minutes']} minutes: {link['url']}")
+
 
 def cmd_connect(args) -> None:
     ok(f"connected as [num]{lab.connect(args.url, args.token)}[/]"
@@ -1618,6 +1632,8 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--stop", action="store_true", help="stop it")
     s.add_argument("--timeout", type=int, default=900, help="seconds to wait for it (default 900)")
     s.set_defaults(run=cmd_serve)
+    s = sub.add_parser("page", help="a link that signs a browser in to your lab page")
+    s.set_defaults(run=cmd_page)
     s = sub.add_parser("status", help="GPU, vLLM, lab connection, data and models")
     s.set_defaults(run=cmd_status)
     s = sub.add_parser("vespa", help="your own Vespa in Docker: up, deploy, down, status")
