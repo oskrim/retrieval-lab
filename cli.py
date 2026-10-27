@@ -1049,7 +1049,8 @@ def query_search(path: pathlib.Path, module, question: str, name: str, k: int) -
     with console.status("loading the data"):
         ds = lab.load(name, dict(EVAL_SETS)[name])
     start = time.time()
-    rows = checked_search(module, path)(ds, question, k=min(k, len(ds.ids)))
+    with console.status("searching (a new question loads the question encoder: a few seconds)"):
+        rows = checked_search(module, path)(ds, question, k=min(k, len(ds.ids)))
     console.print(Text.assemble((name, "bold"), f" · {file_key(str(path))} · {len(rows)} of {len(ds.ids):,} documents · ",
                                 f"{time.time() - start:.1f} s"))
     width = max(40, console.width - 6)
