@@ -7,6 +7,7 @@ import contextlib
 import functools
 import gzip
 import hashlib
+import html
 import importlib.util
 import io
 import json
@@ -1051,13 +1052,38 @@ def query_search(path: pathlib.Path, module, question: str, name: str, k: int) -
     start = time.time()
     with console.status("searching (a new question loads the question encoder: a few seconds)"):
         rows = checked_search(module, path)(ds, question, k=min(k, len(ds.ids)))
-    console.print(Text.assemble((name, "bold"), f" · {file_key(str(path))} · {len(rows)} of {len(ds.ids):,} documents · ",
-                                f"{time.time() - start:.1f} s"))
-    width = max(40, console.width - 6)
+    stems = {lab.stem(w) for w in re.findall(r"\w+", lab.normalize(question)) if w not in lab.STOPWORDS}
+    table = Table(box=None, padding=(0, 1), header_style="dim", caption_style="dim", caption_justify="left",
+                  width=min(console.width, QUERY_WIDTH),
+                  caption=f"{name} · top {len(rows)} of {len(ds.ids):,} documents · {time.time() - start:.1f} s")
+    table.add_column("", style="dim", justify="right", no_wrap=True)
+    table.add_column("document", no_wrap=True, overflow="ellipsis", ratio=1)
+    table.add_column("id", style="dim", no_wrap=True)
     for n, i in enumerate(rows, 1):
-        title = (cut(ds.titles[i], width // 3), "bold") if ds.titles[i] else ""
-        console.print(Text.assemble(f"{n:>4}  ", title, " · " if title else "", cut(" ".join(ds.bodies[i].split()), width)),
-                      no_wrap=True, overflow="ellipsis")
+        text = Text.assemble(*([(ds.titles[i], "bold"), "  "] if ds.titles[i] else []))
+        text.append_text(snippet(html.unescape(ds.bodies[i]), stems, QUERY_WIDTH // 2))
+        table.add_row(str(n), text, ds.ids[i])
+    console.print(table)
+
+
+QUERY_WIDTH = 110  # lab query's table: a line of text, not the terminal's width
+
+
+def snippet(text: str, stems: set[str], width: int) -> Text:
+    """text on one line from a little before its first word with a stem in stems, those words highlighted."""
+    words = list(re.finditer(r"\w+", text := " ".join(text.split())))
+    hits = [m for m in words if lab.stem(lab.normalize(m.group())) in stems]
+    start = text.rfind(" ", 0, hits[0].start() - width // 4) + 1 if hits and hits[0].start() > width // 2 else 0
+    out = Text("…" if start else "")
+    at = start
+    for m in hits:
+        if m.start() < start:
+            continue
+        out.append(text[at:m.start()])
+        out.append(m.group(), "acc")
+        at = m.end()
+    out.append(text[at:])
+    return out
 
 
 DEAL_FIELDS = ("company", "stage", "country")

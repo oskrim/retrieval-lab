@@ -545,7 +545,8 @@ def test_query_search_shows_the_top_k_for_any_question(tmp_path, capsys, monkeyp
     monkeypatch.setattr(cli, "named_file", lambda word: str(path))
     assert cli.main(["query", "search", "how", "to", "lower", "tax"]) == 0
     out = capsys.readouterr().out
-    assert "2 of 2 documents" in " ".join(out.split()) and out.index("1  Capital gains") < out.index("2  Tax basics · Pay less tax")
+    flat = " ".join(out.split())
+    assert "top 2 of 2 documents" in flat and flat.index("1 Capital gains explained. b") < flat.index("2 Tax basics Pay less tax. a")
 
 
 def test_query_agent_shows_the_answer_with_its_deals(tmp_path, capsys, monkeypatch):
