@@ -127,8 +127,7 @@ schema dataset {
     # Notebook 11 for now; remove a # to add notebook 12's phrases and 15's vectors (the hybrid).
     first-phase {
       expression {
-        0
-        + lexical
+        lexical
         # + phrases
         # + vectors
       }
