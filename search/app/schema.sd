@@ -107,11 +107,11 @@ schema dataset {
   # The query(...) numbers default to common's inputs; search.py's INPUTS overrides them per query.
 
   # YOUR SEARCH ALGORITHM HERE
-  rank-profile matching inherits common {
+  rank-profile hybrid inherits common {
 
-    # Notebook 4: how many of the question's words the body contains.
+    # Notebook 15: saturated BM25 of both fields, phrases, and the question against the documents' sign bits.
     first-phase {
-      expression: matchCount(body)
+      expression: saturated(bm25(body)) + saturated(bm25(title)) + query(phrase_weight) * phrase_share + query(dense_weight) * max(0, dense)
     }
 
     # Notebook 17, late interaction on the best 30: uncomment both phases and set LATE = True in search.py.
