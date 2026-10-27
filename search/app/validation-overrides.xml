@@ -1,0 +1,6 @@
+<!-- Lets a deploy change a field's type, which empties the field until lab vespa up feeds it again. Vespa ignores an
+     allow after its date and refuses one more than 30 days ahead. -->
+<validation-overrides>
+  <allow until="2026-11-20">field-type-change</allow>
+  <allow until="2026-11-20">tensor-type-change</allow>
+</validation-overrides>

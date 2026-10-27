@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- One Vespa node: a container that answers queries and takes the feed, and a content cluster that holds both datasets. -->
+<services version="1.0">
+  <container id="default" version="1.0">
+    <search/>
+    <document-api/>
+    <!-- English words stem with Snowball (Porter 2), as the notebook's do, instead of Vespa's default KStem. -->
+    <config name="ai.vespa.opennlp.open-nlp">
+      <snowballStemmingForEnglish>true</snowballStemmingForEnglish>
+    </config>
+  </container>
+  <content id="content" version="1.0">
+    <redundancy>1</redundancy>
+    <documents>
+      <document type="fiqa" mode="index"/>
+      <document type="caiq" mode="index"/>
+    </documents>
+    <!-- Vespa blocks the feed when the disk is 80% full; on a lab box the models fill most of it, and the lab's data is
+         about 5 GB, so the feed stops only at 95%. -->
+    <tuning>
+      <resource-limits>
+        <disk>0.95</disk>
+      </resource-limits>
+    </tuning>
+  </content>
+</services>

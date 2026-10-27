@@ -1,0 +1,5 @@
+.lab.json
+__pycache__/
+data
+.ipynb_checkpoints/
+*.egg-info/

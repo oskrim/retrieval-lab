@@ -1,0 +1,111 @@
+# The schema of both datasets (fiqa, caiq). An edit to a rank profile deploys with lab eval search; an edit to the
+# document fields needs lab vespa up, which feeds again.
+schema dataset {
+
+  document dataset {
+    field id type string {
+      indexing: attribute | summary
+      attribute: fast-search
+    }
+    field title type string {
+      indexing: index | summary
+      index: enable-bm25
+    }
+    field body type string {
+      indexing: index | summary
+      index: enable-bm25
+    }
+    # pplx document vectors: float, and centered sign bits packed 8 to an int8
+    field dense_float type tensor<float>(x[1024]) {
+      indexing: attribute
+      attribute {
+        distance-metric: dotproduct
+      }
+    }
+    field dense_bits type tensor<int8>(x[128]) {
+      indexing: attribute
+      attribute {
+        distance-metric: hamming
+      }
+    }
+    # late-interaction token vectors: int8 with a scale per token, and sign bits
+    field late_int8 type tensor<int8>(t{}, x[128]) {
+      indexing: attribute
+    }
+    field late_scale type tensor<float>(t{}) {
+      indexing: attribute
+    }
+    field late_bits type tensor<int8>(t{}, x[16]) {
+      indexing: attribute
+    }
+  }
+
+  # title and body again, matched only by the question's word pairs (phrases)
+  field title_pairs type string {
+    indexing: input title | index
+  }
+  field body_pairs type string {
+    indexing: input body | index
+  }
+
+  fieldset default {
+    fields: title, body
+  }
+
+  document-summary ids {
+    summary id {}
+  }
+
+  # The notebook's building blocks. search.py sends the query(...) inputs.
+  rank-profile common {
+    inputs {
+      query(q) tensor<float>(x[1024])
+      query(qc) tensor<float>(x[1024])
+      query(qbits) tensor<int8>(x[128])
+      query(qlate_bits) tensor<int8>(qt{}, x[16])
+      query(qlate_float) tensor<float>(qt{}, x[128])
+      query(saturation): 25.0
+      query(pair_count): 0.0
+    }
+    # notebook 11
+    function saturated(x) {
+      expression: x / (query(saturation) + x)
+    }
+    # notebook 12
+    function phrase_share() {
+      expression: (0.5 * matchCount(body_pairs) + matchCount(title_pairs)) / max(1, query(pair_count))
+    }
+    # notebook 14
+    function cosine() {
+      expression: sum(query(q) * attribute(dense_float))
+    }
+    # notebook 15
+    function dense() {
+      expression: (2 * sum(query(qc) * unpack_bits(attribute(dense_bits))) - sum(query(qc))) / 32
+    }
+    # notebook 17
+    function late_int8() {
+      expression: reduce(reduce(reduce(query(qlate_float) * attribute(late_int8), sum, x) * attribute(late_scale), max, t), sum, qt)
+    }
+    function late() {
+      expression: reduce(reduce(128 - 2 * reduce(hamming(query(qlate_bits), attribute(late_bits)), sum, x), max, t), sum, qt)
+    }
+  }
+
+  # What a rank expression can use:
+  #   common's functions   saturated(x), phrase_share, cosine, dense, late, late_int8
+  #   text                 bm25(title), bm25(body), matchCount(body), nativeRank(body), fieldMatch(body).proximity
+  #   vectors              closeness(field, dense_bits) (with nearestNeighbor in the query), attribute(dense_float)
+  #   your numbers         query(name): declare it under inputs, send it in search.py's INPUTS
+  #   math                 + - * /, max(a, b), log(x), pow(x, y), if(a > b, x, y)
+  #   phases               first-phase over every match; second-phase { rerank-count: N  expression: ... } over the
+  #                        best N; global-phase { rerank-count: N  expression: ... } after them, where firstPhase,
+  #                        secondPhase and normalize_linear(x) (scales a score to 0..1 over the N) work
+  # Rename the profile freely; search.py's PROFILE names the one it queries.
+  rank-profile matching inherits common {
+    # YOUR SEARCH ALGORITHM HERE. For now notebook 4: how many of the question's words the body contains.
+    first-phase {
+      expression: matchCount(body)
+    }
+  }
+}
