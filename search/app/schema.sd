@@ -93,17 +93,16 @@ schema dataset {
   }
 
   # What a rank expression can use:
-  #   common's functions   saturated(x), phrase_share, cosine, dense, late, late_int8
-  #   text                 bm25(title), bm25(body), matchCount(body), nativeRank(body), fieldMatch(body).proximity
-  #   vectors              closeness(field, dense_bits) (with nearestNeighbor in the query), attribute(dense_float)
-  #   your numbers         query(name): declare it under inputs, send it in search.py's INPUTS
-  #   math                 + - * /, max(a, b), log(x), pow(x, y), if(a > b, x, y)
-  #   phases               first-phase over every match; second-phase { rerank-count: N  expression: ... } over the
-  #                        best N; global-phase { rerank-count: N  expression: ... } after them, where firstPhase,
-  #                        secondPhase and normalize_linear(x) (scales a score to 0..1 over the N) work
+  #   common     saturated(x), phrase_share, cosine, dense, late, late_int8
+  #   text       bm25(title), bm25(body), matchCount(body), nativeRank(body)
+  #   vectors    closeness(field, dense_bits), attribute(dense_float)
+  #   inputs     query(name), declared under inputs and sent in search.py's INPUTS
+  #   math       + - * /, max(a, b), log(x), pow(x, y), if(a > b, x, y)
+  #   phases     first-phase scores every match; second-phase and global-phase { rerank-count: N ... } the best N;
+  #              global-phase can use firstPhase, secondPhase and normalize_linear(x)
   #
+  # YOUR SEARCH ALGORITHM HERE. For now notebook 4: how many of the question's words the body contains.
   rank-profile matching inherits common {
-    # YOUR SEARCH ALGORITHM HERE. For now notebook 4: how many of the question's words the body contains.
     first-phase {
       expression: matchCount(body)
     }
